@@ -18,7 +18,14 @@ import json
 import traceback
 import zlib
 
-MAX_TESTS = 20
+TEMPLATES = [
+    "<u>{CANARY}</u>",
+    "<{CANARY}>",
+    "<{CANARY}",
+    '"{CANARY}',
+    "'{CANARY}",
+    "`{CANARY}"
+]
 
 
 class AllowedContentTypeTableModel(AbstractTableModel):
@@ -820,20 +827,31 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                         'source': 'query'
                     })
             has_query = len(existing_params) > 0
+
             top_param_names = self._top_params_model.get_enabled_values()
+            top_params = []
             top_pairs = []
-            if self._use_top_params and top_param_names:
+            top_enabled = self._use_top_params and bool(top_param_names)
+            if top_enabled:
                 for name in top_param_names:
                     top_pairs.append([name, ''])
+                    top_params.append({
+                        'name': name,
+                        'base_value': '',
+                        'is_existing': False,
+                        'source': 'top'
+                    })
             else:
                 top_param_names = []
+
             response_bytes = messageInfo.getResponse()
             response_raw = self._to_bytes(response_bytes)
             body_offset = response_info.getBodyOffset()
             body_bytes = response_raw[body_offset:]
             content_type = self._extract_content_type(response_info)
-            extracted_params = []
+
             extract_enabled_effective = self._extract_from_resp or (self._auto_check_urls_without_param and not has_query)
+            extracted_params = []
             if extract_enabled_effective:
                 extracted_names = self.extract_parameters_from_html_or_js_or_json_or_xml(body_bytes, content_type)
                 for name in extracted_names:
@@ -843,6 +861,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                         'is_existing': False,
                         'source': 'extracted'
                     })
+
             phases = []
 
             def _clone_params(params):
@@ -873,15 +892,19 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
 
             existing_pairs = []
             for param in existing_params:
-                existing_pairs.append([param['name'], param['base_value']])
+                base_value = param.get('base_value', '')
+                if base_value is None:
+                    base_value = ''
+                existing_pairs.append([param['name'], base_value])
 
-            if extract_enabled_effective and has_query:
+            if has_query and extract_enabled_effective:
                 phase_a_base = _clone_pairs(existing_pairs)
                 if top_pairs:
                     phase_a_base.extend(_clone_pairs(top_pairs))
                 phase_a_targets = _clone_params(existing_params)
                 if phase_a_targets:
                     phases.append({
+                        'name': 'url',
                         'base_query_pairs': phase_a_base,
                         'target_params': phase_a_targets
                     })
@@ -889,21 +912,40 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 if phase_b_targets:
                     phase_b_base = []
                     if top_pairs:
-                        phase_b_base = _clone_pairs(top_pairs)
+                        phase_b_base.extend(_clone_pairs(top_pairs))
                     phases.append({
+                        'name': 'resp',
                         'base_query_pairs': phase_b_base,
                         'target_params': phase_b_targets
                     })
-            elif extract_enabled_effective and not has_query:
-                phase_base = []
-                if top_pairs:
-                    phase_base = _clone_pairs(top_pairs)
-                phase_targets = _clone_params(extracted_params)
-                if phase_targets:
-                    phases.append({
-                        'base_query_pairs': phase_base,
-                        'target_params': phase_targets
-                    })
+            elif not has_query:
+                if top_enabled and top_params:
+                    phase_top_targets = _clone_params(top_params)
+                    if phase_top_targets:
+                        phases.append({
+                            'name': 'top',
+                            'base_query_pairs': [],
+                            'target_params': phase_top_targets
+                        })
+                    if extract_enabled_effective and extracted_params:
+                        phase_b_targets = _clone_params(extracted_params)
+                        if phase_b_targets:
+                            phase_b_base = []
+                            if top_pairs:
+                                phase_b_base.extend(_clone_pairs(top_pairs))
+                            phases.append({
+                                'name': 'resp',
+                                'base_query_pairs': phase_b_base,
+                                'target_params': phase_b_targets
+                            })
+                elif extract_enabled_effective and extracted_params:
+                    phase_targets = _clone_params(extracted_params)
+                    if phase_targets:
+                        phases.append({
+                            'name': 'resp',
+                            'base_query_pairs': [],
+                            'target_params': phase_targets
+                        })
             else:
                 phase_base = _clone_pairs(existing_pairs)
                 if top_pairs:
@@ -911,6 +953,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 phase_targets = _clone_params(existing_params)
                 if phase_targets:
                     phases.append({
+                        'name': 'url',
                         'base_query_pairs': phase_base,
                         'target_params': phase_targets
                     })
@@ -931,22 +974,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             path = request_info.getUrl().getPath()
             if not path:
                 path = '/'
-            append_templates = [
-                '<u>{CANARY}</u>',
-                '<{CANARY}>',
-                '<{CANARY}',
-                '"{CANARY}',
-                "'{CANARY}",
-                '`{CANARY}'
-            ]
-            replace_templates = [
-                '<u>{CANARY}</u>',
-                '<{CANARY}>',
-                '<{CANARY}',
-                '"{CANARY}',
-                "'{CANARY}",
-                '`{CANARY}'
-            ]
             tests_sent = 0
             issue_entries = []
             message_markers = {}
@@ -956,10 +983,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 if not active_target_params:
                     continue
                 base_pairs_phase = phase.get('base_query_pairs') or []
-                chunks = self._chunk_list(active_target_params, self._chunk)
                 if self._check_individually:
                     param_sets = [[param] for param in active_target_params]
                 else:
+                    chunks = self._chunk_list(active_target_params, self._chunk)
                     param_sets = [list(chunk) for chunk in chunks if chunk]
                 for param_set in param_sets:
                     if tests_sent >= self._get_max_tests():
@@ -967,8 +994,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                     for mode in modes:
                         if tests_sent >= self._get_max_tests():
                             break
-                        templates = append_templates if mode == 'append' else replace_templates
-                        for template in templates:
+                        for template in TEMPLATES:
                             if tests_sent >= self._get_max_tests():
                                 break
                             canary = self._get_canary()
