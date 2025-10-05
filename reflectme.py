@@ -10,7 +10,6 @@ from javax.swing.table import AbstractTableModel
 from javax.swing.event import ChangeListener
 from javax.swing import AbstractAction
 import threading
-import random
 import re
 import json
 import traceback
@@ -687,7 +686,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                         for template in templates:
                             if tests_sent >= MAX_TESTS:
                                 break
-                            canary = 'jxr_' + ('%08x' % random.getrandbits(32))
+                            canary = 'mmdhacker'
                             payload = template.replace('{CANARY}', canary)
                             mutated_query = self._build_query_for_request(mode, param_set, base_query_pairs, payload, canary)
                             if mutated_query is None:
