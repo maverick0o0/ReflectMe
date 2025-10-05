@@ -278,6 +278,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         self._rate_limit_blocked = set()
         self._debug_verbose = True
         self._debug_max_dump = 4000
+        self._emitted_first_reflect_issue = False
         self._build_ui()
         callbacks.addSuiteTab(self)
         callbacks.registerHttpListener(self)
@@ -497,10 +498,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             detail = "<p>Debug: Start button pressed. If you see this, addScanIssue works.</p>"
             issue = ReflectMeIssue(service, url,
                                    "ReflectMe Debug Start Signal",
-                                   detail, "Information", "Firm", [])
+                                   detail, "Information", "Firm", ArrayList())
             self._log("[ReflectMe][DEBUG] start-issue severity=%r confidence=%r" % (issue.getSeverity(), issue.getConfidence()))
-            self._callbacks.addScanIssue(issue)
-            self._log("[ReflectMe][DEBUG] Emitted start debug issue")
+            try:
+                self._callbacks.addScanIssue(issue)
+                self._log("[ReflectMe][DEBUG] Emitted start debug issue")
+            except Exception:
+                traceback.print_exc()
         except Exception:
             traceback.print_exc()
 
@@ -793,7 +797,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 if tests_sent >= MAX_TESTS:
                     break
             if issue_entries:
-                http_messages = []
+                http_messages = ArrayList()
                 for key in message_markers:
                     item = message_markers[key]
                     markers_list = ArrayList()
@@ -802,15 +806,22 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                     base_msg = item['message']
                     try:
                         marked = self._callbacks.applyMarkers(base_msg, None, markers_list)
-                        http_messages.append(marked if marked is not None else base_msg)
+                        if marked is not None:
+                            http_messages.add(marked)
+                        else:
+                            http_messages.add(base_msg)
                     except Exception:
-                        http_messages.append(base_msg)
+                        http_messages.add(base_msg)
                 detail = self._build_issue_detail(issue_entries)
                 issue = ReflectMeIssue(service, request_info.getUrl(),
                                        "Reflected input detected (ReflectMe)",
                                        detail, "Information", "Firm", http_messages)
                 self._log("[ReflectMe][DEBUG] issue severity=%r confidence=%r" % (issue.getSeverity(), issue.getConfidence()))
-                self._callbacks.addScanIssue(issue)
+                try:
+                    self._callbacks.addScanIssue(issue)
+                    self._log("[ReflectMe][DEBUG] Emitted aggregated reflection issue ({0} entries)".format(len(issue_entries)))
+                except Exception:
+                    traceback.print_exc()
         except Exception:
             traceback.print_exc()
 
@@ -1004,6 +1015,39 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 'snippet': snippet
             }
             issue_entries.append(entry)
+            # Emit a quick confirm issue on first detection to guarantee visibility
+            try:
+                if allowed_content_type and not getattr(self, '_emitted_first_reflect_issue', False):
+                    markers_list_quick = ArrayList()
+                    for start, end in result.get('markers', []):
+                        markers_list_quick.add(jarray('i', [int(start), int(end)]))
+                    try:
+                        marked_one = self._callbacks.applyMarkers(http_request_response, None, markers_list_quick)
+                    except Exception:
+                        marked_one = None
+                    http_messages_one = ArrayList()
+                    http_messages_one.add(marked_one if marked_one is not None else http_request_response)
+
+                    try:
+                        analyzed_req = self._helpers.analyzeRequest(http_request_response)
+                        quick_url = analyzed_req.getUrl() if analyzed_req is not None else None
+                    except Exception:
+                        quick_url = None
+
+                    snippet_html = self._html_escape(result.get('snippet', ''))
+                    micro_detail = "<p>Quick confirm: payload reflected.</p><pre>{0}</pre>".format(snippet_html)
+
+                    quick_issue = ReflectMeIssue(service, quick_url,
+                                                 "Reflected input detected (ReflectMe)",
+                                                 micro_detail, "Information", "Firm", http_messages_one)
+                    try:
+                        self._callbacks.addScanIssue(quick_issue)
+                        self._emitted_first_reflect_issue = True
+                        self._log("[ReflectMe][DEBUG] Quick confirm issue emitted")
+                    except Exception:
+                        traceback.print_exc()
+            except Exception:
+                traceback.print_exc()
             return True
         except Exception:
             traceback.print_exc()
@@ -1028,12 +1072,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 entry['issued'] = True
                 self._rate_limit_blocked.add(rate_key)
                 detail = self._build_rate_limit_detail(entry)
-                messages = [self._callbacks.saveBuffersToTempFiles(http_request_response)]
+                messages = ArrayList()
+                messages.add(self._callbacks.saveBuffersToTempFiles(http_request_response))
                 issue = ReflectMeIssue(service, url,
                                        "ReflectMe: received >5 responses with HTTP 429 (Too Many Requests) — testing suspended for this target/timeframe.",
                                        detail, "Information", "Firm", messages)
                 self._log("[ReflectMe][DEBUG] rate-limit issue severity=%r confidence=%r" % (issue.getSeverity(), issue.getConfidence()))
-                self._callbacks.addScanIssue(issue)
+                try:
+                    self._callbacks.addScanIssue(issue)
+                except Exception:
+                    traceback.print_exc()
 
     def _build_rate_limit_detail(self, entry):
         count = entry.get('count', 0)
