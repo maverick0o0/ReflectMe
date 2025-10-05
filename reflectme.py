@@ -271,6 +271,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         self._running = False
         self._scope_only = True
         self._extract_from_resp = False
+        self._use_top_params = False
         self._check_individually = False
         self._chunk = 10
         self._scanned_urls = set()
@@ -281,6 +282,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         self._emitted_first_reflect_issue = False
         self._last_seen_url = None
         self._last_seen_service = None
+        self._custom_canary = "mmdhacker"
         self._build_ui()
         callbacks.addSuiteTab(self)
         callbacks.registerHttpListener(self)
@@ -377,9 +379,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         self._check_individual_checkbox.addActionListener(ReflectMeActionListener(self._toggle_check_individual))
         options_panel.add(self._check_individual_checkbox)
 
+        self._use_top_params_checkbox = JCheckBox("Use Top Parameters", False)
+        self._use_top_params_checkbox.addActionListener(ReflectMeActionListener(self._toggle_use_top_params))
+        options_panel.add(self._use_top_params_checkbox)
+
         self._debug_checkbox = JCheckBox("Debug: log search details", True)
         self._debug_checkbox.addActionListener(ReflectMeActionListener(self._toggle_debug))
         options_panel.add(self._debug_checkbox)
+
+        canary_panel = JPanel()
+        canary_panel.setLayout(BoxLayout(canary_panel, BoxLayout.X_AXIS))
+        canary_panel.add(JLabel("Custom Canary:"))
+        self._canary_field = JTextField("mmdhacker", 16)
+        self._canary_field.addActionListener(ReflectMeActionListener(self._canary_updated))
+        canary_panel.add(self._canary_field)
+        options_panel.add(canary_panel)
 
         panel.add(options_panel)
 
@@ -509,9 +523,26 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
     def _toggle_check_individual(self, event):
         self._check_individually = self._check_individual_checkbox.isSelected()
 
+    def _toggle_use_top_params(self, event):
+        self._use_top_params = self._use_top_params_checkbox.isSelected()
+
     def _toggle_debug(self, event):
         if hasattr(self, '_debug_checkbox'):
             self._debug_verbose = self._debug_checkbox.isSelected()
+
+    def _canary_updated(self, event):
+        try:
+            self._custom_canary = self._get_canary()
+        except Exception:
+            self._custom_canary = "mmdhacker"
+
+    def _get_canary(self):
+        try:
+            text = self._canary_field.getText()
+            text = text.strip() if text is not None else ""
+        except Exception:
+            text = ""
+        return text if text else "mmdhacker"
 
     def _chunk_changed(self, event):
         try:
@@ -752,34 +783,95 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                         'source': 'query'
                     })
             has_query = len(existing_params) > 0
-            top_params_enabled = self._top_params_model.get_enabled_values()
-            target_params = list(existing_params)
-            if top_params_enabled:
-                for name in top_params_enabled:
-                    target_params.append({
+            top_param_names = self._top_params_model.get_enabled_values()
+            top_params = []
+            if self._use_top_params and top_param_names:
+                for name in top_param_names:
+                    top_params.append({
                         'name': name,
                         'base_value': '',
                         'is_existing': False,
                         'source': 'top'
                     })
+            else:
+                top_param_names = []
             response_bytes = messageInfo.getResponse()
             response_raw = self._to_bytes(response_bytes)
             body_offset = response_info.getBodyOffset()
             body_bytes = response_raw[body_offset:]
             content_type = self._extract_content_type(response_info)
             extracted_params = []
-            if (not has_query) and self._extract_from_resp:
-                extracted_params = self.extract_parameters_from_html_or_js_or_json_or_xml(body_bytes, content_type)
-                for name in extracted_params:
-                    target_params.append({
+            if self._extract_from_resp:
+                extracted_names = self.extract_parameters_from_html_or_js_or_json_or_xml(body_bytes, content_type)
+                for name in extracted_names:
+                    extracted_params.append({
                         'name': name,
                         'base_value': '',
                         'is_existing': False,
                         'source': 'extracted'
                     })
-            if not has_query and not extracted_params:
-                return
-            if not target_params:
+            phases = []
+
+            def _clone_params(params):
+                clones = []
+                for param in params:
+                    clone = {}
+                    try:
+                        for key in param:
+                            clone[key] = param[key]
+                    except Exception:
+                        pass
+                    clones.append(clone)
+                return clones
+
+            existing_pairs = []
+            for param in existing_params:
+                existing_pairs.append([param['name'], param['base_value']])
+
+            top_pairs = []
+            if self._use_top_params and top_param_names:
+                for name in top_param_names:
+                    top_pairs.append([name, ''])
+
+            if has_query:
+                phase_a_targets = _clone_params(existing_params)
+                if self._use_top_params and top_params:
+                    phase_a_targets.extend(_clone_params(top_params))
+                if phase_a_targets:
+                    phases.append({
+                        'existing_pairs': existing_pairs,
+                        'top_pairs': top_pairs,
+                        'target_params': phase_a_targets
+                    })
+                if self._extract_from_resp:
+                    phase_b_targets = _clone_params(extracted_params)
+                    if self._use_top_params and top_params:
+                        phase_b_targets.extend(_clone_params(top_params))
+                    if phase_b_targets:
+                        phases.append({
+                            'existing_pairs': [],
+                            'top_pairs': top_pairs,
+                            'target_params': phase_b_targets
+                        })
+            else:
+                if self._extract_from_resp:
+                    phase_targets = _clone_params(extracted_params)
+                    if self._use_top_params and top_params:
+                        phase_targets.extend(_clone_params(top_params))
+                    if phase_targets:
+                        phases.append({
+                            'existing_pairs': [],
+                            'top_pairs': top_pairs,
+                            'target_params': phase_targets
+                        })
+                elif self._use_top_params and top_params:
+                    phases.append({
+                        'existing_pairs': [],
+                        'top_pairs': top_pairs,
+                        'target_params': _clone_params(top_params)
+                    })
+
+            if not phases:
                 return
             base_headers = list(request_info.getHeaders())
             request_raw = self._to_bytes(messageInfo.getRequest())
@@ -795,10 +887,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             path = request_info.getUrl().getPath()
             if not path:
                 path = '/'
-            base_query_pairs = []
-            for param in existing_params:
-                base_query_pairs.append([param['name'], param['base_value']])
-            chunks = self._chunk_list(target_params, self._chunk)
             append_templates = [
                 '<u>{CANARY}</u>',
                 '<{CANARY}>',
@@ -812,30 +900,49 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 '<{CANARY}>',
                 '<{CANARY}',
                 '"{CANARY}',
+                "'{CANARY}",
                 '`{CANARY}'
             ]
             tests_sent = 0
             issue_entries = []
             message_markers = {}
-            for mode in ['append', 'replace']:
-                templates = append_templates if mode == 'append' else replace_templates
-                if mode == 'replace' and not target_params:
+            modes = ['append', 'replace']
+            for phase in phases:
+                active_target_params = phase.get('target_params') or []
+                if not active_target_params:
                     continue
-                for chunk in chunks:
-                    if not chunk:
-                        continue
-                    param_sets = []
-                    if self._check_individually:
-                        for param in chunk:
-                            param_sets.append([param])
-                    else:
-                        param_sets.append(list(chunk))
-                    for param_set in param_sets:
+                existing_pairs_phase = phase.get('existing_pairs') or []
+                top_pairs_phase = phase.get('top_pairs') or []
+                chunks = self._chunk_list(active_target_params, self._chunk)
+                if self._check_individually:
+                    param_sets = [[param] for param in active_target_params]
+                else:
+                    param_sets = [list(chunk) for chunk in chunks if chunk]
+                for param_set in param_sets:
+                    if tests_sent >= MAX_TESTS:
+                        break
+                    for mode in modes:
+                        if tests_sent >= MAX_TESTS:
+                            break
+                        templates = append_templates if mode == 'append' else replace_templates
                         for template in templates:
                             if tests_sent >= MAX_TESTS:
                                 break
-                            canary = 'mmdhacker'
+                            canary = self._get_canary()
                             payload = template.replace('{CANARY}', canary)
+                            base_query_pairs = []
+                            for name, value in existing_pairs_phase:
+                                base_query_pairs.append([name, value])
+                            if top_pairs_phase:
+                                for name, value in top_pairs_phase:
+                                    include_top = True
+                                    if mode == 'append':
+                                        for param in param_set:
+                                            if param.get('source') == 'top' and param.get('name') == name:
+                                                include_top = False
+                                                break
+                                    if include_top:
+                                        base_query_pairs.append([name, value])
                             mutated_query = self._build_query_for_request(mode, param_set, base_query_pairs, payload, canary)
                             if mutated_query is None:
                                 continue
@@ -856,8 +963,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                                     return
                         if tests_sent >= MAX_TESTS:
                             break
-                    if tests_sent >= MAX_TESTS:
-                        break
                 if tests_sent >= MAX_TESTS:
                     break
             if issue_entries:
