@@ -800,7 +800,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             if header is None:
                 continue
             lower = header.lower()
+            # strip our loop-prevention header if present
             if lower.startswith('x-jxr-ext'):
+                continue
+            # drop Accept-Encoding to avoid compressed bodies in active tests
+            if lower.startswith('accept-encoding'):
                 continue
             if first_line is None:
                 first_line = header
@@ -823,7 +827,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         else:
             request_path = path
         start_line = method + ' ' + request_path + ' ' + http_version
+        # enforce identity encoding for reliable matching & markers
         headers.insert(0, start_line)
+        headers.append('Accept-Encoding: identity')
         headers.append('X-JXR-EXT: 1')
         return headers
 
@@ -842,42 +848,26 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 self._register_rate_limit(service, rate_key, http_request_response)
             if not self._is_allowed_content_type(response_info):
                 return False
-            response_raw = self._to_bytes(response_bytes)
-            body_offset = response_info.getBodyOffset()
-            raw_body = response_raw[body_offset:]
-            # NEW: decompress if needed
-            search_body, was_decompressed = self._decompress_if_needed(raw_body, response_info)
-
             if payload is None:
                 return False
             payload_bytes = self._to_bytes(payload)
             if payload_bytes is None or payload_bytes == '':
                 return False
-
-            index = search_body.find(payload_bytes)
-            if index == -1:
+            # --- NEW unified search ---
+            result = self._search_payload_and_mark(http_request_response, payload, response_info)
+            if not result.get('found'):
                 return False
 
-            markers = []
-            if not was_decompressed:
-                # Only compute absolute byte ranges when body wasn't compressed
-                payload_length = len(payload_bytes)
-                cur = index
-                while cur != -1:
-                    start = body_offset + cur
-                    end = start + payload_length
-                    markers.append([start, end])
-                    cur = search_body.find(payload_bytes, cur + payload_length)
-            # If decompressed, we still create the issue but skip markers (cannot map to compressed wire offsets)
+            # Track message and markers (may be empty if decompressed)
             base_msg = http_request_response
             key = id(base_msg)
             if key not in message_markers:
                 message_markers[key] = {'message': base_msg, 'markers': []}
-            for marker in markers:
-                message_markers[key]['markers'].append(marker)
+            for m in result.get('markers', []):
+                message_markers[key]['markers'].append(m)
+
             content_type = self._extract_content_type(response_info)
-            # Build snippet from the SAME buffer we searched in:
-            snippet = self._build_snippet(search_body, payload_bytes)
+            snippet = result.get('snippet', '')
             try:
                 basestring
             except NameError:
@@ -978,6 +968,73 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         except Exception:
             traceback.print_exc()
             return ''
+
+    def _search_payload_and_mark(self, http_request_response, payload, response_info):
+        """
+        Returns dict: {
+          'found': bool,
+          'markers': list of [start,end] byte ranges (may be empty),
+          'snippet': unicode snippet around the first match (safe to render)
+        }
+        Strategy:
+          - Prefer searching on raw Java byte[] with helpers.indexOf when not compressed.
+          - If compressed (gzip/deflate), decompress body and search there; return no markers.
+        """
+        try:
+            # Raw response bytes and offsets
+            resp_bytes = http_request_response.getResponse()  # Java byte[]
+            if resp_bytes is None:
+                return {'found': False, 'markers': [], 'snippet': ''}
+
+            body_offset = response_info.getBodyOffset()
+
+            # Detect compression
+            enc = self._get_header_value(response_info, "content-encoding")
+            enc_l = (enc or '').lower()
+
+            # Pattern as Java byte[] (ASCII-safe for our payloads)
+            pat = self._helpers.stringToBytes(payload)
+
+            # Path A: no compression -> use helpers.indexOf over raw byte[]
+            if not enc_l or 'identity' in enc_l:
+                start = self._helpers.indexOf(resp_bytes, pat, True, body_offset, len(resp_bytes))
+                if start == -1:
+                    return {'found': False, 'markers': [], 'snippet': ''}
+
+                # Collect all occurrences for markers
+                markers = []
+                pat_len = len(pat)
+                cur = start
+                while cur != -1:
+                    markers.append([cur, cur + pat_len])
+                    cur = self._helpers.indexOf(resp_bytes, pat, True, cur + pat_len, len(resp_bytes))
+
+                # Build snippet from the raw-bytes view we already maintain
+                resp_raw = self._to_bytes(resp_bytes)
+                snippet = self._build_snippet(resp_raw, self._to_bytes(payload))
+                return {'found': True, 'markers': markers, 'snippet': snippet}
+
+            # Path B: compressed -> decompress body only, search, but return no markers
+            resp_raw = self._to_bytes(resp_bytes)
+            raw_body = resp_raw[body_offset:]
+            search_body, was_decomp = self._decompress_if_needed(raw_body, response_info)
+
+            if not was_decomp:
+                # Could be an unsupported encoding; bail out
+                return {'found': False, 'markers': [], 'snippet': ''}
+
+            payload_bytes = self._to_bytes(payload)
+            idx = search_body.find(payload_bytes)
+            if idx == -1:
+                return {'found': False, 'markers': [], 'snippet': ''}
+
+            snippet = self._build_snippet(search_body, payload_bytes)
+            # no markers because we cannot map decompressed offsets back to the wire
+            return {'found': True, 'markers': [], 'snippet': snippet}
+
+        except Exception:
+            traceback.print_exc()
+            return {'found': False, 'markers': [], 'snippet': ''}
 
     def _chunk_list(self, data, size):
         chunks = []
