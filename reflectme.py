@@ -354,7 +354,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             "multipart/x-mixed-replace",
             "application/rdf+xml",
             "application/mathml+xml",
-            "application/json",
             "text/plain",
         ]
         for value in defaults:
@@ -624,9 +623,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         try:
             headers = response_info.getHeaders()
             if headers is None:
+                self._last_content_type_decision = (None, 'no-headers')
                 return False
             allowed = self._allowed_model.get_enabled_values()
             if not allowed:
+                self._last_content_type_decision = (None, 'no-allowed-types')
                 return False
             content_type = None
             for header in headers:
@@ -639,14 +640,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                         content_type = parts[1].strip()
                     break
             if content_type is None:
+                self._last_content_type_decision = (None, 'no-content-type')
                 return False
             lowered = content_type.lower()
+            if 'application/json' in lowered:
+                self._last_content_type_decision = (content_type, 'hard-skip-json')
+                return False
             for value in allowed:
                 if value.lower() in lowered:
+                    self._last_content_type_decision = (content_type, 'allowed-match')
                     return True
+            self._last_content_type_decision = (content_type, 'not-allowed')
             return False
         except Exception:
             traceback.print_exc()
+            self._last_content_type_decision = (None, 'exception')
             return False
 
     def _execute_scanner(self, messageInfo, request_info, response_info, url_key):
@@ -914,8 +922,38 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             if status_code == 429:
                 self._register_rate_limit(service, rate_key, http_request_response)
             allowed_content_type = self._is_allowed_content_type(response_info)
+            content_type_value = None
+            decision_reason = None
+            try:
+                decision_info = getattr(self, '_last_content_type_decision', None)
+            except Exception:
+                decision_info = None
+            if isinstance(decision_info, tuple) and len(decision_info) >= 2:
+                content_type_value, decision_reason = decision_info[0], decision_info[1]
+            if content_type_value is None:
+                content_type_value = self._extract_content_type(response_info)
             payload_value = payload if payload is not None else ''
             result = self._search_payload_and_mark(http_request_response, payload_value, response_info, canary)
+            if isinstance(result, dict):
+                diag = result.get('diag')
+                if not isinstance(diag, dict):
+                    diag = {}
+                    result['diag'] = diag
+                diag['content_type_value'] = content_type_value or ''
+                diag['content_type_allowed'] = bool(allowed_content_type)
+                if decision_reason is not None:
+                    diag['content_type_reason'] = decision_reason
+                notes = diag.get('notes')
+                if not isinstance(notes, list):
+                    notes = []
+                if not allowed_content_type:
+                    reason_note = 'Skipped by content-type: {0}'.format(content_type_value or '(none)')
+                    if decision_reason == 'hard-skip-json':
+                        reason_note += ' (hard JSON skip)'
+                    elif decision_reason:
+                        reason_note += ' ({0})'.format(decision_reason)
+                    notes.append(reason_note)
+                diag['notes'] = notes
             self._dump_debug_report(http_request_response, response_info, result, payload_value)
             if not allowed_content_type:
                 return False
@@ -1075,10 +1113,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 'payload_htmlencoded': self._html_escape(payload if payload is not None else ''),
                 'raw_found': False,
                 'raw_first_index': -1,
+                'raw_first_index_all': -1,
                 'raw_markers_count': 0,
                 'raw_snippet': u'',
                 'raw_canary_found': False,
                 'raw_canary_index': -1,
+                'raw_canary_index_first': -1,
+                'raw_canary_index_all': -1,
                 'raw_canary_snippet': u'',
                 'was_compressed': False,
                 'decomp_found_exact': False,
@@ -1090,7 +1131,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 'decomp_snippet_exact': u'',
                 'decomp_snippet_urlenc': u'',
                 'decomp_snippet_htmlenc': u'',
-                'notes': []
+                'notes': [],
+                'adjacency_used': False,
+                'adjacent_char': '',
+                'adjacent_side': '',
+                'adjacency_markers_count': 0,
+                'adjacency_first_index': -1
             }
 
             try:
@@ -1132,44 +1178,129 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             total_len = len(resp_bytes)
             resp_raw = self._to_bytes(resp_bytes)
             raw_markers = []
+            first_payload_index = None
+            raw_index_body = -1
+            raw_index_all = -1
             if payload_len > 0 and payload_bytes_java is not None:
                 try:
-                    raw_index = self._helpers.indexOf(resp_bytes, payload_bytes_java, True, body_offset, total_len)
+                    raw_index_body = self._helpers.indexOf(resp_bytes, payload_bytes_java, True, body_offset, total_len)
                 except Exception:
-                    raw_index = -1
-                diag['raw_first_index'] = raw_index
-                if raw_index != -1:
-                    diag['raw_found'] = True
-                    cur = raw_index
-                    while cur != -1 and payload_len > 0:
-                        raw_markers.append([int(cur), int(cur + payload_len)])
-                        try:
-                            cur = self._helpers.indexOf(resp_bytes, payload_bytes_java, True, cur + payload_len, total_len)
-                        except Exception:
-                            break
-                    diag['raw_markers_count'] = len(raw_markers)
-                    snippet = _build_snippet(resp_raw, raw_index, payload_len)
-                    diag['raw_snippet'] = _clip(snippet)
-                    result['snippet'] = snippet
-                else:
-                    diag['raw_markers_count'] = 0
+                    raw_index_body = -1
+                diag['raw_first_index'] = raw_index_body
+                try:
+                    raw_index_all = self._helpers.indexOf(resp_bytes, payload_bytes_java, True, 0, total_len)
+                except Exception:
+                    raw_index_all = -1
+                diag['raw_first_index_all'] = raw_index_all
 
+            if payload_len > 0 and payload_bytes_py:
+                search_pos = max(body_offset, 0)
+                while True:
+                    idx_py = resp_raw.find(payload_bytes_py, search_pos)
+                    if idx_py == -1:
+                        break
+                    if idx_py < body_offset:
+                        search_pos = idx_py + 1
+                        continue
+                    raw_markers.append([int(idx_py), int(idx_py + payload_len)])
+                    if first_payload_index is None:
+                        first_payload_index = idx_py
+                    search_pos = idx_py + payload_len if payload_len > 0 else idx_py + 1
+
+            diag['raw_markers_count'] = len(raw_markers)
+            if first_payload_index is not None:
+                diag['raw_found'] = True
+                snippet = _build_snippet(resp_raw, first_payload_index, payload_len)
+                diag['raw_snippet'] = _clip(snippet)
+                result['snippet'] = snippet
+                if raw_index_body == -1 and raw_index_all != -1 and raw_index_all >= body_offset:
+                    try:
+                        diag['notes'].append('Fallback raw search matched at index {0}'.format(raw_index_all))
+                    except Exception:
+                        pass
+            else:
+                diag['raw_markers_count'] = 0
+
+            special_chars = ['<', '>', '"', "'", '`']
+            adjacency_markers = []
+            adjacency_first_index = -1
+            adjacency_char = ''
+            adjacency_side = ''
+            canary_len = 0
+            canary_bytes_java = None
+            canary_bytes_py = ''
             if canary:
                 try:
                     canary_bytes_java = self._helpers.stringToBytes(canary)
                 except Exception:
                     canary_bytes_java = None
-                if canary_bytes_java is not None:
-                    try:
-                        canary_index = self._helpers.indexOf(resp_bytes, canary_bytes_java, True, body_offset, total_len)
-                    except Exception:
-                        canary_index = -1
-                    diag['raw_canary_index'] = canary_index
-                    if canary_index != -1:
-                        diag['raw_canary_found'] = True
-                        canary_len = len(canary_bytes_java)
-                        canary_snippet = _build_snippet(resp_raw, canary_index, canary_len)
-                        diag['raw_canary_snippet'] = _clip(canary_snippet)
+                canary_bytes_py = self._to_bytes(canary_bytes_java) if canary_bytes_java is not None else ''
+                try:
+                    canary_len = len(canary_bytes_py)
+                except Exception:
+                    canary_len = 0
+            if canary_len > 0 and canary_bytes_java is not None:
+                try:
+                    canary_index_all = self._helpers.indexOf(resp_bytes, canary_bytes_java, True, 0, total_len)
+                except Exception:
+                    canary_index_all = -1
+                diag['raw_canary_index_all'] = canary_index_all
+            if canary_len > 0 and canary_bytes_py:
+                search_pos = max(body_offset, 0)
+                while True:
+                    idx_canary = resp_raw.find(canary_bytes_py, search_pos)
+                    if idx_canary == -1:
+                        break
+                    if idx_canary < body_offset:
+                        search_pos = idx_canary + 1
+                        continue
+                    if diag['raw_canary_index_first'] == -1:
+                        diag['raw_canary_index_first'] = idx_canary
+                    if diag['raw_canary_index'] == -1:
+                        diag['raw_canary_index'] = idx_canary
+                    diag['raw_canary_found'] = True
+                    if not diag['raw_canary_snippet']:
+                        diag['raw_canary_snippet'] = _clip(_build_snippet(resp_raw, idx_canary, canary_len))
+                    left_idx = idx_canary - 1
+                    right_idx = idx_canary + canary_len
+                    marker_added = False
+                    side_used = ''
+                    char_used = ''
+                    if left_idx >= body_offset and left_idx >= 0:
+                        try:
+                            left_char = resp_raw[left_idx]
+                        except Exception:
+                            left_char = None
+                        if left_char in special_chars:
+                            marker_added = True
+                            side_used = 'left'
+                            char_used = left_char
+                    if (not marker_added) and right_idx < len(resp_raw) and right_idx >= body_offset:
+                        try:
+                            right_char = resp_raw[right_idx]
+                        except Exception:
+                            right_char = None
+                        if right_char in special_chars:
+                            marker_added = True
+                            side_used = 'right'
+                            char_used = right_char
+                    if marker_added:
+                        adjacency_markers.append([int(idx_canary), int(idx_canary + canary_len)])
+                        if adjacency_first_index == -1:
+                            adjacency_first_index = idx_canary
+                            adjacency_char = char_used
+                            adjacency_side = side_used
+                    if canary_len > 0:
+                        search_pos = idx_canary + canary_len
+                    else:
+                        search_pos = idx_canary + 1
+                diag['adjacency_markers_count'] = len(adjacency_markers)
+                if adjacency_first_index != -1:
+                    diag['adjacency_first_index'] = adjacency_first_index
+                    diag['adjacent_char'] = adjacency_char or ''
+                    diag['adjacent_side'] = adjacency_side or ''
+            else:
+                diag['adjacency_markers_count'] = 0
 
             raw_body = resp_raw[body_offset:]
             search_body, was_decomp = self._decompress_if_needed(raw_body, response_info)
@@ -1214,11 +1345,37 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             if payload_len == 0:
                 diag['notes'].append('Empty payload supplied; skipping raw search')
 
-            result['found'] = diag['raw_found'] and diag['identity_encoding'] and payload_len > 0
-            if result['found']:
-                result['markers'] = raw_markers
+            found = False
+            markers_to_use = []
+            if payload_len > 0 and diag['identity_encoding'] and raw_markers:
+                found = True
+                markers_to_use = raw_markers
+            elif adjacency_markers and diag['identity_encoding']:
+                found = True
+                markers_to_use = adjacency_markers
+                diag['adjacency_used'] = True
+                if adjacency_first_index != -1:
+                    snippet = _build_snippet(resp_raw, adjacency_first_index, canary_len)
+                    if snippet:
+                        result['snippet'] = snippet
+                    diag['raw_canary_snippet'] = _clip(_build_snippet(resp_raw, adjacency_first_index, canary_len))
+                diag['notes'].append('Adjacency rule triggered (special-char neighbour: {0}, side: {1})'.format(
+                    adjacency_char or '', adjacency_side or ''))
+            else:
+                diag['adjacency_used'] = False
+
+            if found:
+                result['found'] = True
+                result['markers'] = markers_to_use
                 if not result['snippet']:
-                    result['snippet'] = diag.get('raw_snippet', u'')
+                    if markers_to_use:
+                        first_idx = markers_to_use[0][0]
+                        if markers_to_use is raw_markers:
+                            length = payload_len
+                        else:
+                            length = canary_len
+                        snippet = _build_snippet(resp_raw, first_idx, length)
+                        result['snippet'] = snippet
             else:
                 result['markers'] = []
                 if not result['snippet']:
