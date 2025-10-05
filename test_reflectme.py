@@ -20,11 +20,15 @@ class _ScanIssue(object):
 class _Parameter(object):
     PARAM_URL = 0
 
+class _IHttpService(object):
+    pass
+
 burp_module.IBurpExtender = _IBurpExtender
 burp_module.ITab = _ITab
 burp_module.IHttpListener = _IHttpListener
 burp_module.IScanIssue = _ScanIssue
 burp_module.IParameter = _Parameter
+burp_module.IHttpService = _IHttpService
 sys.modules.setdefault('burp', burp_module)
 
 # Stub Java Swing/AWT dependencies
@@ -79,6 +83,27 @@ class ChangeListener(object):
 swing_event_module.ChangeListener = ChangeListener
 sys.modules.setdefault('javax.swing.event', swing_event_module)
 
+java_net_module = types.ModuleType('java.net')
+
+class URL(object):
+    def __init__(self, value):
+        self._value = value
+
+    def toString(self):
+        return self._value
+
+java_net_module.URL = URL
+sys.modules.setdefault('java.net', java_net_module)
+java_module.net = java_net_module
+
+jarray_module = types.ModuleType('jarray')
+
+def array(typecode, values):
+    return list(values)
+
+jarray_module.array = array
+sys.modules.setdefault('jarray', jarray_module)
+
 from reflectme import BurpExtender
 
 
@@ -98,18 +123,32 @@ class MockResponseInfo(object):
         return self._headers
 
 
-class MockByteArray(object):
-    def __init__(self, raw, response_info):
-        self._raw = raw
-        self.response_info = response_info
+class MockByteArray(str):
+    def __new__(cls, raw, response_info):
+        obj = str.__new__(cls, raw)
+        obj.response_info = response_info
+        return obj
 
     def tostring(self):
-        return self._raw
+        return str(self)
 
 
 class MockHelpers(object):
     def analyzeResponse(self, response_bytes):
         return response_bytes.response_info
+
+    def stringToBytes(self, value):
+        return value
+
+    def indexOf(self, data, pattern, case_sensitive, start, end):
+        segment = data[start:end]
+        idx = segment.find(pattern)
+        if idx == -1:
+            return -1
+        return start + idx
+
+    def urlEncode(self, value):
+        return value
 
 
 class MockCallbacks(object):
@@ -151,6 +190,8 @@ class ReflectMeLiteralMatchTest(unittest.TestCase):
         extender._callbacks = MockCallbacks()
         extender._helpers = MockHelpers()
         extender._allowed_model = DummyAllowedModel()
+        extender._debug_verbose = False
+        extender._debug_max_dump = 4000
 
         payload = '<"mmdhacker">'
         response = build_response(payload)
