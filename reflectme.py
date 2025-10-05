@@ -839,16 +839,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             body_bytes = response_raw[body_offset:]
             if payload is None:
                 return False
-            index = body_bytes.find(payload)
+            payload_bytes = self._to_bytes(payload)
+            if payload_bytes is None:
+                return False
+            if payload_bytes == '':
+                return False
+            index = body_bytes.find(payload_bytes)
             if index == -1:
                 return False
             markers = []
-            payload_length = len(payload)
+            payload_length = len(payload_bytes)
             while index != -1:
                 start = body_offset + index
                 end = start + payload_length
                 markers.append([start, end])
-                index = body_bytes.find(payload, index + payload_length)
+                index = body_bytes.find(payload_bytes, index + payload_length)
             if not markers:
                 return False
             persisted = self._callbacks.saveBuffersToTempFiles(http_request_response)
@@ -858,7 +863,17 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             for marker in markers:
                 message_markers[key]['markers'].append(marker)
             content_type = self._extract_content_type(response_info)
-            snippet = self._build_snippet(body_bytes, payload)
+            snippet = self._build_snippet(body_bytes, payload_bytes)
+            try:
+                basestring
+            except NameError:
+                string_types = (str,)
+            else:
+                string_types = (basestring,)
+            if isinstance(payload, string_types):
+                payload_literal = payload
+            else:
+                payload_literal = self._safe_to_unicode(payload_bytes)
             params_names = []
             for param in param_set:
                 params_names.append(param['name'])
@@ -866,7 +881,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 'parameter': ', '.join(params_names),
                 'mode': mode,
                 'strategy': 'least-change' if mode == 'append' else 'full-replace',
-                'payload': payload,
+                'payload': payload_literal,
                 'content_type': content_type,
                 'snippet': snippet
             }
@@ -933,13 +948,17 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         parts.append('</table>')
         return ''.join(parts)
 
-    def _build_snippet(self, body_bytes, payload):
+    def _build_snippet(self, body_bytes, payload_bytes):
         try:
-            index = body_bytes.find(payload)
+            if payload_bytes is None:
+                return ''
+            if payload_bytes == '':
+                return ''
+            index = body_bytes.find(payload_bytes)
             if index == -1:
                 return ''
             start = max(0, index - 50)
-            end = min(len(body_bytes), index + len(payload) + 50)
+            end = min(len(body_bytes), index + len(payload_bytes) + 50)
             snippet_bytes = body_bytes[start:end]
             return self._safe_to_unicode(snippet_bytes)
         except Exception:
