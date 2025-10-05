@@ -286,22 +286,22 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         if not getattr(self, '_debug_verbose', False):
             return
         try:
-            if msg is None:
-                text = ''
-            else:
-                text = self._safe_to_unicode(msg)
+            text = self._safe_to_unicode('' if msg is None else msg)
         except Exception:
             try:
                 text = str(msg)
             except Exception:
                 text = ''
+        # Ensure Output tab visibility
+        try:
+            self._callbacks.printOutput(text)
+        except Exception:
+            pass
+        # Fallback to stdout
         try:
             print(text)
         except Exception:
-            try:
-                print(str(text))
-            except Exception:
-                pass
+            pass
 
     def _build_ui(self):
         panel = JPanel()
@@ -497,7 +497,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             detail = "<p>Debug: Start button pressed. If you see this, addScanIssue works.</p>"
             issue = ReflectMeIssue(service, url,
                                    "ReflectMe Debug Start Signal",
-                                   detail, "Critical", "Firm", [])
+                                   detail, "Information", "Firm", [])
+            self._log("[ReflectMe][DEBUG] start-issue severity=%r confidence=%r" % (issue.getSeverity(), issue.getConfidence()))
             self._callbacks.addScanIssue(issue)
             self._log("[ReflectMe][DEBUG] Emitted start debug issue")
         except Exception:
@@ -808,6 +809,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 issue = ReflectMeIssue(service, request_info.getUrl(),
                                        "Reflected input detected (ReflectMe)",
                                        detail, "Information", "Firm", http_messages)
+                self._log("[ReflectMe][DEBUG] issue severity=%r confidence=%r" % (issue.getSeverity(), issue.getConfidence()))
                 self._callbacks.addScanIssue(issue)
         except Exception:
             traceback.print_exc()
@@ -918,6 +920,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             response_info = self._helpers.analyzeResponse(response_bytes)
             if response_info is None:
                 return False
+            self._dump_http_transaction_raw(http_request_response, response_info, "SCAN-TEST")
             status_code = response_info.getStatusCode()
             if status_code == 429:
                 self._register_rate_limit(service, rate_key, http_request_response)
@@ -1029,6 +1032,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 issue = ReflectMeIssue(service, url,
                                        "ReflectMe: received >5 responses with HTTP 429 (Too Many Requests) — testing suspended for this target/timeframe.",
                                        detail, "Information", "Firm", messages)
+                self._log("[ReflectMe][DEBUG] rate-limit issue severity=%r confidence=%r" % (issue.getSeverity(), issue.getConfidence()))
                 self._callbacks.addScanIssue(issue)
 
     def _build_rate_limit_detail(self, entry):
@@ -1413,6 +1417,55 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             self._log("[ReflectMe][DEBUG] Near-miss canary window: {0}".format(repr(preview)))
         except Exception:
             pass
+
+    def _dump_http_transaction_raw(self, http_request_response, response_info, label):
+        try:
+            if not getattr(self, '_debug_verbose', False):
+                return
+            req_bytes = http_request_response.getRequest()
+            resp_bytes = http_request_response.getResponse()
+
+            req_info = self._helpers.analyzeRequest(http_request_response) if req_bytes is not None else None
+            resp_info = response_info
+            if resp_info is None and resp_bytes is not None:
+                try:
+                    resp_info = self._helpers.analyzeResponse(resp_bytes)
+                except Exception:
+                    resp_info = None
+
+            req_hdrs = []
+            if req_info is not None:
+                for h in (req_info.getHeaders() or []):
+                    req_hdrs.append(self._safe_to_unicode(h))
+
+            resp_hdrs = []
+            body_off = 0
+            if resp_info is not None:
+                for h in (resp_info.getHeaders() or []):
+                    resp_hdrs.append(self._safe_to_unicode(h))
+                try:
+                    body_off = int(resp_info.getBodyOffset())
+                except Exception:
+                    body_off = 0
+
+            max_dump = int(getattr(self, '_debug_max_dump', 4000))
+            resp_raw = self._to_bytes(resp_bytes) if resp_bytes is not None else ''
+            body_preview = resp_raw[body_off: body_off + max_dump]
+
+            lines = []
+            lines.append("[ReflectMe][RAW] ===== {} =====".format(label))
+            if req_hdrs:
+                lines.append("-- REQUEST --")
+                lines.append("\n".join(req_hdrs))
+            if resp_hdrs:
+                lines.append("-- RESPONSE HEADERS --")
+                lines.append("\n".join(resp_hdrs))
+            lines.append("-- RESPONSE BODY (first {} bytes) --".format(max_dump))
+            lines.append(self._safe_to_unicode(body_preview))
+            lines.append("[ReflectMe][RAW END] =====================")
+            self._log("\n".join(lines))
+        except Exception:
+            traceback.print_exc()
 
     def _dump_debug_report(self, http_request_response, response_info, result, payload):
         if not self._debug_verbose:
