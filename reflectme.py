@@ -14,6 +14,7 @@ import threading
 import re
 import json
 import traceback
+import zlib
 
 MAX_TESTS = 20
 
@@ -843,26 +844,31 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 return False
             response_raw = self._to_bytes(response_bytes)
             body_offset = response_info.getBodyOffset()
-            body_bytes = response_raw[body_offset:]
+            raw_body = response_raw[body_offset:]
+            # NEW: decompress if needed
+            search_body, was_decompressed = self._decompress_if_needed(raw_body, response_info)
+
             if payload is None:
                 return False
             payload_bytes = self._to_bytes(payload)
-            if payload_bytes is None:
+            if payload_bytes is None or payload_bytes == '':
                 return False
-            if payload_bytes == '':
-                return False
-            index = body_bytes.find(payload_bytes)
+
+            index = search_body.find(payload_bytes)
             if index == -1:
                 return False
+
             markers = []
-            payload_length = len(payload_bytes)
-            while index != -1:
-                start = body_offset + index
-                end = start + payload_length
-                markers.append([start, end])
-                index = body_bytes.find(payload_bytes, index + payload_length)
-            if not markers:
-                return False
+            if not was_decompressed:
+                # Only compute absolute byte ranges when body wasn't compressed
+                payload_length = len(payload_bytes)
+                cur = index
+                while cur != -1:
+                    start = body_offset + cur
+                    end = start + payload_length
+                    markers.append([start, end])
+                    cur = search_body.find(payload_bytes, cur + payload_length)
+            # If decompressed, we still create the issue but skip markers (cannot map to compressed wire offsets)
             base_msg = http_request_response
             key = id(base_msg)
             if key not in message_markers:
@@ -870,7 +876,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             for marker in markers:
                 message_markers[key]['markers'].append(marker)
             content_type = self._extract_content_type(response_info)
-            snippet = self._build_snippet(body_bytes, payload_bytes)
+            # Build snippet from the SAME buffer we searched in:
+            snippet = self._build_snippet(search_body, payload_bytes)
             try:
                 basestring
             except NameError:
@@ -994,6 +1001,59 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 return str(data)
             except Exception:
                 return ''
+
+    def _get_header_value(self, response_info, key_lower):
+        try:
+            headers = response_info.getHeaders()
+            if headers is None:
+                return None
+            kl = key_lower.lower()
+            for h in headers:
+                if h is None:
+                    continue
+                hl = h.lower()
+                if hl.startswith(kl + ":"):
+                    parts = h.split(":", 1)
+                    if len(parts) == 2:
+                        return parts[1].strip()
+            return None
+        except Exception:
+            return None
+
+    def _decompress_if_needed(self, raw_body_bytes, response_info):
+        """
+        raw_body_bytes: Python str of bytes (as produced by _to_bytes)
+        Returns: (search_body_bytes, is_decompressed_bool)
+        """
+        try:
+            enc = self._get_header_value(response_info, "content-encoding")
+            if not enc:
+                return raw_body_bytes, False
+            enc_l = enc.lower()
+            data = raw_body_bytes
+            # Use zlib so we don't fight with Java streams in Jython.
+            if "gzip" in enc_l:
+                try:
+                    # 16+MAX_WBITS tells zlib to expect a gzip header.
+                    out = zlib.decompress(data, 16 + zlib.MAX_WBITS)
+                    return out, True
+                except Exception:
+                    return raw_body_bytes, False
+            if "deflate" in enc_l:
+                try:
+                    # -MAX_WBITS handles raw deflate streams.
+                    out = zlib.decompress(data, -zlib.MAX_WBITS)
+                    return out, True
+                except Exception:
+                    # Some servers send zlib-wrapped deflate
+                    try:
+                        out = zlib.decompress(data)
+                        return out, True
+                    except Exception:
+                        return raw_body_bytes, False
+            return raw_body_bytes, False
+        except Exception:
+            return raw_body_bytes, False
 
     def _extract_content_type(self, response_info):
         try:
