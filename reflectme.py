@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 from burp import (IBurpExtender, ITab, IHttpListener, IScanIssue, IParameter,
                   IHttpService)
-from java.awt import Dimension
+from java.awt import (Dimension, BorderLayout, GridBagLayout,
+                      GridBagConstraints, Insets, FlowLayout, Color)
 from java.awt.event import ActionListener
 from java.util import ArrayList
 from javax.swing import (JPanel, JLabel, JCheckBox, JButton, JTextField,
                          JScrollPane, JTable, BoxLayout, JTextArea, JSpinner,
-                         SpinnerNumberModel, KeyStroke)
+                         SpinnerNumberModel, KeyStroke, JTabbedPane,
+                         JSeparator, BorderFactory, UIManager, Box)
 from javax.swing.table import AbstractTableModel
 from javax.swing.event import ChangeListener
 from javax.swing import AbstractAction
@@ -370,67 +372,59 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         return out_msg
 
     def _build_ui(self):
-        panel = JPanel()
-        panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
+        self._main_panel = JPanel(BorderLayout())
 
-        options_panel = JPanel()
-        options_panel.setLayout(BoxLayout(options_panel, BoxLayout.Y_AXIS))
-        options_panel.add(JLabel("Scanner options"))
+        tabs = JTabbedPane()
+        tabs.addTab("Scan", self._makeScanTab())
+        tabs.addTab("Content Types", self._makeContentTypesTab())
+        tabs.addTab("Top Params", self._makeTopParamsTab())
 
-        self._scope_checkbox = JCheckBox("Scope only (just check in-scope targets)", True)
-        self._scope_checkbox.addActionListener(ReflectMeActionListener(self._toggle_scope))
-        options_panel.add(self._scope_checkbox)
+        self._main_panel.add(tabs, BorderLayout.CENTER)
+        self._main_panel.add(self._buildStatusBar(), BorderLayout.SOUTH)
 
-        self._extract_checkbox = JCheckBox("Extract params from response", False)
-        self._extract_checkbox.addActionListener(ReflectMeActionListener(self._toggle_extract))
-        options_panel.add(self._extract_checkbox)
+        self._updateControlStates()
+        self._updateStatusColor()
 
-        self._check_individual_checkbox = JCheckBox("Check parameters individually", False)
-        self._check_individual_checkbox.addActionListener(ReflectMeActionListener(self._toggle_check_individual))
-        options_panel.add(self._check_individual_checkbox)
+    def _makeScanTab(self):
+        panel = JPanel(BorderLayout())
+        panel.add(self._buildHeaderPanel(), BorderLayout.NORTH)
 
-        self._use_top_params_checkbox = JCheckBox("Use Top Parameters", False)
-        self._use_top_params_checkbox.addActionListener(ReflectMeActionListener(self._toggle_use_top_params))
-        options_panel.add(self._use_top_params_checkbox)
+        content = JPanel()
+        content.setLayout(BoxLayout(content, BoxLayout.Y_AXIS))
+        content.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8))
 
-        self._auto_check_urls_without_param_checkbox = JCheckBox("Check URLs without parameter", True)
-        self._auto_check_urls_without_param_checkbox.addActionListener(ReflectMeActionListener(self._toggle_auto_check_urls_without_param))
-        options_panel.add(self._auto_check_urls_without_param_checkbox)
+        content.add(self._titled(self._buildScannerOptionsSection(), "Scanner options"))
+        content.add(Box.createVerticalStrut(10))
+        content.add(self._titled(self._buildPayloadLimitsSection(), "Payload & Limits"))
+        content.add(Box.createVerticalStrut(10))
+        content.add(self._titled(self._buildControlsSection(), "Controls"))
 
-        self._debug_checkbox = JCheckBox("Debug: log search details", True)
-        self._debug_checkbox.addActionListener(ReflectMeActionListener(self._toggle_debug))
-        options_panel.add(self._debug_checkbox)
+        panel.add(content, BorderLayout.CENTER)
+        return panel
 
-        canary_panel = JPanel()
-        canary_panel.setLayout(BoxLayout(canary_panel, BoxLayout.X_AXIS))
-        canary_panel.add(JLabel("Custom Canary:"))
-        self._canary_field = JTextField("mmdhacker", 16)
-        self._canary_field.addActionListener(ReflectMeActionListener(self._canary_updated))
-        canary_panel.add(self._canary_field)
-        options_panel.add(canary_panel)
+    def _makeContentTypesTab(self):
+        panel = JPanel(BorderLayout())
+        panel.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8))
 
-        max_tests_panel = JPanel()
-        max_tests_panel.setLayout(BoxLayout(max_tests_panel, BoxLayout.X_AXIS))
-        max_tests_panel.add(JLabel("MAX_TESTS:"))
-        self._max_tests_spinner = JSpinner(SpinnerNumberModel(20, 1, 200, 1))
-        self._max_tests_spinner.addChangeListener(ReflectMeChangeListener(self._max_tests_changed))
-        max_tests_panel.add(self._max_tests_spinner)
-        options_panel.add(max_tests_panel)
+        action_bar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
+        label = JLabel("Allowed Content-Type:")
+        action_bar.add(label)
 
-        panel.add(options_panel)
-
-        allowed_panel = JPanel()
-        allowed_panel.setLayout(BoxLayout(allowed_panel, BoxLayout.Y_AXIS))
-        allowed_panel.add(JLabel("Allowed Content-Type:"))
-
-        add_row_panel = JPanel()
-        add_row_panel.setLayout(BoxLayout(add_row_panel, BoxLayout.X_AXIS))
         self._content_type_field = JTextField()
-        add_row_panel.add(self._content_type_field)
+        self._content_type_field.setColumns(24)
+        self._content_type_field.setToolTipText("Add a MIME type to allow scanning responses.")
+        label.setLabelFor(self._content_type_field)
+        action_bar.add(self._content_type_field)
+
         add_button = JButton("Add")
+        add_button.setMnemonic(ord('A'))
+        add_button.setToolTipText("Add the specified content type.")
         add_button.addActionListener(ReflectMeActionListener(self._add_content_type))
-        add_row_panel.add(add_button)
-        allowed_panel.add(add_row_panel)
+        action_bar.add(add_button)
+
+        self._content_type_field.addActionListener(ReflectMeActionListener(self._add_content_type))
+
+        panel.add(action_bar, BorderLayout.NORTH)
 
         self._allowed_model = AllowedContentTypeTableModel()
         defaults = [
@@ -450,85 +444,320 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             self._allowed_model.add_value(value, True)
 
         self._allowed_table = JTable(self._allowed_model)
+        self._allowed_table.setToolTipText("Toggle to enable or disable a content type for reflection checks.")
+        self._installTableDefaults(self._allowed_table)
         column = self._allowed_table.getColumnModel().getColumn(0)
         column.setPreferredWidth(80)
         column.setMaxWidth(80)
         column.setMinWidth(60)
+
         allowed_scroll = JScrollPane(self._allowed_table)
         allowed_scroll.setPreferredSize(Dimension(0, 220))
-        allowed_panel.add(allowed_scroll)
+        panel.add(allowed_scroll, BorderLayout.CENTER)
 
+        delete_bar = self._buildButtonBar()
         delete_button = JButton("Delete")
+        delete_button.setMnemonic(ord('D'))
+        delete_button.setToolTipText("Remove selected content types.")
         delete_button.addActionListener(ReflectMeActionListener(self._delete_content_types))
-        allowed_panel.add(delete_button)
+        delete_bar.add(delete_button)
+        panel.add(delete_bar, BorderLayout.SOUTH)
 
-        panel.add(allowed_panel)
+        return panel
 
-        top_params_panel = JPanel()
-        top_params_panel.setLayout(BoxLayout(top_params_panel, BoxLayout.Y_AXIS))
-        top_params_panel.add(JLabel("Top params:"))
+    def _makeTopParamsTab(self):
+        panel = JPanel(BorderLayout())
+        panel.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8))
 
-        top_input_panel = JPanel()
-        top_input_panel.setLayout(BoxLayout(top_input_panel, BoxLayout.X_AXIS))
+        action_panel = JPanel(GridBagLayout())
+        action_panel.setBorder(BorderFactory.createEmptyBorder(0, 0, 6, 0))
+
         self._top_params_area = JTextArea(3, 20)
+        self._top_params_area.setLineWrap(True)
+        self._top_params_area.setWrapStyleWord(True)
+        self._top_params_area.setToolTipText("Enter parameters separated by spaces, commas, or semicolons. Press Enter to add.")
         top_scroll_area = JScrollPane(self._top_params_area)
-        top_scroll_area.setPreferredSize(Dimension(0, 80))
-        top_input_panel.add(top_scroll_area)
-        top_add_button = JButton("Add")
-        top_add_button.addActionListener(ReflectMeActionListener(self._add_top_params))
-        top_input_panel.add(top_add_button)
-        top_params_panel.add(top_input_panel)
+        top_scroll_area.setPreferredSize(Dimension(0, 90))
+
+        input_constraints = GridBagConstraints()
+        input_constraints.gridx = 0
+        input_constraints.gridy = 0
+        input_constraints.weightx = 1.0
+        input_constraints.fill = GridBagConstraints.BOTH
+        input_constraints.insets = Insets(0, 0, 0, 6)
+        action_panel.add(top_scroll_area, input_constraints)
+
+        add_button = JButton("Add")
+        add_button.setMnemonic(ord('T'))
+        add_button.setToolTipText("Add the provided parameters to the Top list.")
+        add_button.addActionListener(ReflectMeActionListener(self._add_top_params))
+
+        button_constraints = GridBagConstraints()
+        button_constraints.gridx = 1
+        button_constraints.gridy = 0
+        button_constraints.anchor = GridBagConstraints.NORTH
+        button_constraints.insets = Insets(0, 0, 0, 0)
+        action_panel.add(add_button, button_constraints)
 
         self._top_params_area.getInputMap().put(KeyStroke.getKeyStroke("ENTER"), "addTopParams")
         self._top_params_area.getActionMap().put("addTopParams", ReflectMeAbstractAction(self._add_top_params))
 
+        panel.add(action_panel, BorderLayout.NORTH)
+
         self._top_params_model = TopParamsTableModel()
         self._top_params_table = JTable(self._top_params_model)
+        self._top_params_table.setToolTipText("Toggle to enable or disable individual top parameters.")
+        self._installTableDefaults(self._top_params_table)
         top_column = self._top_params_table.getColumnModel().getColumn(0)
         top_column.setPreferredWidth(80)
         top_column.setMaxWidth(80)
         top_column.setMinWidth(60)
+
         top_scroll = JScrollPane(self._top_params_table)
         top_scroll.setPreferredSize(Dimension(0, 220))
-        top_params_panel.add(top_scroll)
+        panel.add(top_scroll, BorderLayout.CENTER)
 
-        top_delete_button = JButton("Delete")
-        top_delete_button.addActionListener(ReflectMeActionListener(self._delete_top_params))
-        top_params_panel.add(top_delete_button)
+        delete_bar = self._buildButtonBar()
+        delete_button = JButton("Delete")
+        delete_button.setMnemonic(ord('D'))
+        delete_button.setToolTipText("Remove selected parameters.")
+        delete_button.addActionListener(ReflectMeActionListener(self._delete_top_params))
+        delete_bar.add(delete_button)
+        panel.add(delete_bar, BorderLayout.SOUTH)
 
-        panel.add(top_params_panel)
+        return panel
 
-        chunk_panel = JPanel()
-        chunk_panel.setLayout(BoxLayout(chunk_panel, BoxLayout.X_AXIS))
-        chunk_panel.add(JLabel("Chunk (params per request):"))
+    def _buildHeaderPanel(self):
+        panel = JPanel()
+        panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
+        panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 4, 10))
+
+        title = JLabel("ReflectMe — Smart Reflection Scanner")
+        try:
+            font = title.getFont()
+            title.setFont(font.deriveFont(font.getSize2D() + 2.0))
+        except Exception:
+            pass
+        panel.add(title)
+
+        subtitle = JLabel("Automated reflection checks with URL/Response/Top parameters")
+        subtitle.setForeground(UIManager.getColor("Label.disabledForeground"))
+        panel.add(subtitle)
+
+        separator = JSeparator()
+        separator.setAlignmentX(0.0)
+        separator.setMaximumSize(Dimension(32767, separator.getPreferredSize().height))
+        panel.add(Box.createVerticalStrut(6))
+        panel.add(separator)
+
+        return panel
+
+    def _buildScannerOptionsSection(self):
+        panel = JPanel(GridBagLayout())
+
+        self._scope_checkbox = JCheckBox("Scope only")
+        self._scope_checkbox.setSelected(True)
+        self._scope_checkbox.setMnemonic(ord('S'))
+        self._scope_checkbox.setToolTipText("Limit checks to in-scope targets.")
+        self._scope_checkbox.addActionListener(ReflectMeActionListener(self._toggle_scope))
+
+        self._extract_checkbox = JCheckBox("Extract params from response")
+        self._extract_checkbox.setMnemonic(ord('E'))
+        self._extract_checkbox.setToolTipText("Also test parameters discovered in response bodies.")
+        self._extract_checkbox.addActionListener(ReflectMeActionListener(self._toggle_extract))
+
+        self._check_individual_checkbox = JCheckBox("Check parameters individually")
+        self._check_individual_checkbox.setMnemonic(ord('I'))
+        self._check_individual_checkbox.setToolTipText("Send separate requests to verify each parameter individually.")
+        self._check_individual_checkbox.addActionListener(ReflectMeActionListener(self._toggle_check_individual))
+
+        self._use_top_params_checkbox = JCheckBox("Use Top Parameters")
+        self._use_top_params_checkbox.setMnemonic(ord('U'))
+        self._use_top_params_checkbox.setToolTipText("Append your Top params to the URL and/or test them when URL has no query.")
+        self._use_top_params_checkbox.addActionListener(ReflectMeActionListener(self._toggle_use_top_params))
+
+        self._auto_check_urls_without_param_checkbox = JCheckBox("Check URLs without parameter")
+        self._auto_check_urls_without_param_checkbox.setSelected(True)
+        self._auto_check_urls_without_param_checkbox.setMnemonic(ord('C'))
+        self._auto_check_urls_without_param_checkbox.setToolTipText("Auto run extraction when URL has no query params.")
+        self._auto_check_urls_without_param_checkbox.addActionListener(ReflectMeActionListener(self._toggle_auto_check_urls_without_param))
+
+        self._debug_checkbox = JCheckBox("Debug: log search details")
+        self._debug_checkbox.setSelected(True)
+        self._debug_checkbox.setMnemonic(ord('D'))
+        self._debug_checkbox.setToolTipText("Log detailed reflection matching information.")
+        self._debug_checkbox.addActionListener(ReflectMeActionListener(self._toggle_debug))
+
+        checkboxes = [
+            self._scope_checkbox,
+            self._extract_checkbox,
+            self._check_individual_checkbox,
+            self._use_top_params_checkbox,
+            self._auto_check_urls_without_param_checkbox,
+            self._debug_checkbox,
+        ]
+
+        for idx, checkbox in enumerate(checkboxes):
+            constraints = GridBagConstraints()
+            constraints.gridx = idx % 2
+            constraints.gridy = idx // 2
+            constraints.anchor = GridBagConstraints.WEST
+            constraints.insets = Insets(4, 6, 4, 6)
+            constraints.weightx = 0.5
+            panel.add(checkbox, constraints)
+
+        filler = GridBagConstraints()
+        filler.gridx = 0
+        filler.gridy = (len(checkboxes) + 1) // 2
+        filler.weightx = 1.0
+        filler.weighty = 1.0
+        filler.gridwidth = 2
+        filler.fill = GridBagConstraints.BOTH
+        panel.add(JPanel(), filler)
+
+        return panel
+
+    def _buildPayloadLimitsSection(self):
+        panel = JPanel(GridBagLayout())
+        row = 0
+
+        self._canary_field = JTextField("mmdhacker", 16)
+        self._canary_field.setToolTipText("Marker inserted into payload templates.")
+        self._canary_field.addActionListener(ReflectMeActionListener(self._canary_updated))
+        row = self._addFormRow(panel, row, "Custom Canary:", self._canary_field)
+
+        self._max_tests_spinner = JSpinner(SpinnerNumberModel(20, 1, 200, 1))
+        self._max_tests_spinner.setToolTipText("Global cap on total requests per URL.")
+        self._max_tests_spinner.addChangeListener(ReflectMeChangeListener(self._max_tests_changed))
+        row = self._addFormRow(panel, row, "MAX_TESTS:", self._max_tests_spinner)
+
         self._chunk_spinner = JSpinner(SpinnerNumberModel(10, 1, 50, 1))
+        self._chunk_spinner.setToolTipText("How many parameters to mutate per request.")
         self._chunk_spinner.addChangeListener(ReflectMeChangeListener(self._chunk_changed))
-        chunk_panel.add(self._chunk_spinner)
-        panel.add(chunk_panel)
+        row = self._addFormRow(panel, row, "Chunk (params per request):", self._chunk_spinner)
 
-        control_panel = JPanel()
-        control_panel.setLayout(BoxLayout(control_panel, BoxLayout.X_AXIS))
+        self._addFormFiller(panel, row)
+
+        return panel
+
+    def _buildControlsSection(self):
+        button_bar = self._buildButtonBar()
 
         self._start_button = JButton("Start")
+        self._start_button.setMnemonic(ord('R'))
+        self._start_button.setToolTipText("Start scanning incoming proxy traffic.")
         self._start_button.addActionListener(ReflectMeActionListener(self._start_scanner))
-        control_panel.add(self._start_button)
+        button_bar.add(self._start_button)
 
         self._stop_button = JButton("Stop")
+        self._stop_button.setMnemonic(ord('P'))
+        self._stop_button.setToolTipText("Stop scanning new traffic.")
         self._stop_button.addActionListener(ReflectMeActionListener(self._stop_scanner))
-        control_panel.add(self._stop_button)
+        button_bar.add(self._stop_button)
 
         clear_button = JButton("Clear scanned URLs")
+        clear_button.setMnemonic(ord('L'))
+        clear_button.setToolTipText("Clear the internal list of already scanned URLs.")
         clear_button.addActionListener(ReflectMeActionListener(self._clear_scanned))
-        control_panel.add(clear_button)
+        button_bar.add(clear_button)
+
+        container = JPanel(BorderLayout())
+        container.add(button_bar, BorderLayout.EAST)
+        return container
+
+    def _buildStatusBar(self):
+        panel = JPanel(BorderLayout())
+        separator_color = UIManager.getColor("Separator.foreground")
+        if separator_color is None:
+            separator_color = UIManager.getColor("Label.foreground")
+        panel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(1, 0, 0, 0, separator_color),
+            BorderFactory.createEmptyBorder(6, 10, 6, 10)))
 
         self._status_label = JLabel("Status: Stopped")
-        control_panel.add(self._status_label)
+        self._status_label.setToolTipText("Current scanner state.")
+        panel.add(self._status_label, BorderLayout.WEST)
 
-        panel.add(control_panel)
+        return panel
 
-        self._main_panel = panel
+    def _addFormRow(self, panel, row, label_text, component):
+        label = JLabel(label_text)
+        label.setHorizontalAlignment(JLabel.RIGHT)
+        label.setLabelFor(component)
+        preferred = label.getPreferredSize()
+        label.setPreferredSize(Dimension(180, preferred.height))
 
-        self._content_type_field.addActionListener(ReflectMeActionListener(self._add_content_type))
+        label_constraints = GridBagConstraints()
+        label_constraints.gridx = 0
+        label_constraints.gridy = row
+        label_constraints.anchor = GridBagConstraints.EAST
+        label_constraints.insets = Insets(4, 6, 4, 6)
+        panel.add(label, label_constraints)
+
+        component_constraints = GridBagConstraints()
+        component_constraints.gridx = 1
+        component_constraints.gridy = row
+        component_constraints.weightx = 1.0
+        component_constraints.fill = GridBagConstraints.HORIZONTAL
+        component_constraints.insets = Insets(4, 6, 4, 6)
+        panel.add(component, component_constraints)
+
+        return row + 1
+
+    def _addFormFiller(self, panel, row):
+        filler_constraints = GridBagConstraints()
+        filler_constraints.gridx = 0
+        filler_constraints.gridy = row
+        filler_constraints.weightx = 1.0
+        filler_constraints.weighty = 1.0
+        filler_constraints.gridwidth = 2
+        filler_constraints.fill = GridBagConstraints.BOTH
+        panel.add(JPanel(), filler_constraints)
+
+    def _titled(self, child, title):
+        wrapper = JPanel(BorderLayout())
+        wrapper.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createTitledBorder(title),
+            BorderFactory.createEmptyBorder(8, 8, 8, 8)))
+        wrapper.add(child, BorderLayout.CENTER)
+        return wrapper
+
+    def _buildButtonBar(self):
+        bar = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0))
+        bar.setOpaque(False)
+        return bar
+
+    def _installTableDefaults(self, table):
+        try:
+            table.setRowHeight(22)
+            table.setFillsViewportHeight(True)
+            table.setShowGrid(False)
+            table.setIntercellSpacing(Dimension(0, 0))
+            table.setAutoResizeMode(JTable.AUTO_RESIZE_LAST_COLUMN)
+        except Exception:
+            pass
+
+    def _updateControlStates(self):
+        running = bool(getattr(self, '_running', False))
+        try:
+            if hasattr(self, '_start_button') and self._start_button is not None:
+                self._start_button.setEnabled(not running)
+            if hasattr(self, '_stop_button') and self._stop_button is not None:
+                self._stop_button.setEnabled(running)
+        except Exception:
+            pass
+
+    def _updateStatusColor(self):
+        try:
+            txt = self._status_label.getText().lower()
+            if 'running' in txt:
+                self._status_label.setForeground(Color(0, 180, 0))
+            elif 'stopped' in txt:
+                self._status_label.setForeground(Color(200, 0, 0))
+            else:
+                self._status_label.setForeground(Color(220, 140, 0))
+        except Exception:
+            pass
 
     def getTabCaption(self):
         return "ReflectMe"
@@ -602,12 +831,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         with self._lock:
             self._running = True
             self._status_label.setText("Status: Running")
+        self._updateControlStates()
+        self._updateStatusColor()
         self._emit_start_test_issue()
 
     def _stop_scanner(self, event):
         with self._lock:
             self._running = False
             self._status_label.setText("Status: Stopped")
+        self._updateControlStates()
+        self._updateStatusColor()
 
     def _clear_scanned(self, event):
         with self._lock:
