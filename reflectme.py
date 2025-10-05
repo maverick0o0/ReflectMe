@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-from burp import IBurpExtender, ITab, IHttpListener, IScanIssue, IParameter
+from burp import (IBurpExtender, ITab, IHttpListener, IScanIssue, IParameter,
+                  IHttpService)
 from java.awt import Dimension
 from java.awt.event import ActionListener
 from java.util import ArrayList
@@ -10,6 +11,7 @@ from javax.swing.table import AbstractTableModel
 from javax.swing.event import ChangeListener
 from javax.swing import AbstractAction
 from jarray import array as jarray
+from java.net import URL
 import threading
 import re
 import json
@@ -244,6 +246,22 @@ class ReflectMeAbstractAction(AbstractAction):
             traceback.print_exc()
 
 
+class ReflectMeHttpService(IHttpService):
+    def __init__(self, host, port, protocol):
+        self._host = host
+        self._port = port
+        self._protocol = protocol
+
+    def getHost(self):
+        return self._host
+
+    def getPort(self):
+        return self._port
+
+    def getProtocol(self):
+        return self._protocol
+
+
 class BurpExtender(IBurpExtender, ITab, IHttpListener):
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
@@ -258,9 +276,32 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         self._scanned_urls = set()
         self._rate_limit_counts = {}
         self._rate_limit_blocked = set()
+        self._debug_verbose = True
+        self._debug_max_dump = 4000
         self._build_ui()
         callbacks.addSuiteTab(self)
         callbacks.registerHttpListener(self)
+
+    def _log(self, msg):
+        if not getattr(self, '_debug_verbose', False):
+            return
+        try:
+            if msg is None:
+                text = ''
+            else:
+                text = self._safe_to_unicode(msg)
+        except Exception:
+            try:
+                text = str(msg)
+            except Exception:
+                text = ''
+        try:
+            print(text)
+        except Exception:
+            try:
+                print(str(text))
+            except Exception:
+                pass
 
     def _build_ui(self):
         panel = JPanel()
@@ -281,6 +322,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         self._check_individual_checkbox = JCheckBox("Check parameters individually", False)
         self._check_individual_checkbox.addActionListener(ReflectMeActionListener(self._toggle_check_individual))
         options_panel.add(self._check_individual_checkbox)
+
+        self._debug_checkbox = JCheckBox("Debug: log search details", True)
+        self._debug_checkbox.addActionListener(ReflectMeActionListener(self._toggle_debug))
+        options_panel.add(self._debug_checkbox)
 
         panel.add(options_panel)
 
@@ -411,6 +456,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
     def _toggle_check_individual(self, event):
         self._check_individually = self._check_individual_checkbox.isSelected()
 
+    def _toggle_debug(self, event):
+        if hasattr(self, '_debug_checkbox'):
+            self._debug_verbose = self._debug_checkbox.isSelected()
+
     def _chunk_changed(self, event):
         try:
             value = int(self._chunk_spinner.getValue())
@@ -425,6 +474,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         with self._lock:
             self._running = True
             self._status_label.setText("Status: Running")
+        self._emit_start_test_issue()
 
     def _stop_scanner(self, event):
         with self._lock:
@@ -436,6 +486,23 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             self._scanned_urls.clear()
             self._rate_limit_counts.clear()
             self._rate_limit_blocked.clear()
+
+    def _emit_start_test_issue(self):
+        try:
+            url = None
+            try:
+                url = URL("http://reflectme.local/start-check")
+            except Exception:
+                url = None
+            service = ReflectMeHttpService("reflectme.local", 80, "http")
+            detail = "<p>Debug: Start button pressed. If you see this, addScanIssue works.</p>"
+            issue = ReflectMeIssue(service, url,
+                                   "ReflectMe Debug Start Signal",
+                                   detail, "Critical", "Firm", [])
+            self._callbacks.addScanIssue(issue)
+            self._log("[ReflectMe][DEBUG] Emitted start debug issue")
+        except Exception:
+            traceback.print_exc()
 
     def _add_content_type(self, event):
         value = self._content_type_field.getText()
@@ -846,24 +913,25 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             status_code = response_info.getStatusCode()
             if status_code == 429:
                 self._register_rate_limit(service, rate_key, http_request_response)
-            if not self._is_allowed_content_type(response_info):
+            allowed_content_type = self._is_allowed_content_type(response_info)
+            payload_value = payload if payload is not None else ''
+            result = self._search_payload_and_mark(http_request_response, payload_value, response_info, canary)
+            self._dump_debug_report(http_request_response, response_info, result, payload_value)
+            if not allowed_content_type:
                 return False
-            if payload is None:
-                return False
-            payload_bytes = self._to_bytes(payload)
-            if payload_bytes is None or payload_bytes == '':
-                return False
-            # --- NEW unified search ---
-            result = self._search_payload_and_mark(http_request_response, payload, response_info)
             if not result.get('found'):
-                try:
-                    body_offset = response_info.getBodyOffset()
-                except Exception:
-                    body_offset = 0
-                self._debug_near_miss(response_bytes, body_offset, canary)
+                diag = result.get('diag', {}) if isinstance(result, dict) else {}
+                raw_canary_found = diag.get('raw_canary_found') if isinstance(diag, dict) else False
+                if raw_canary_found:
+                    try:
+                        body_offset = diag.get('body_offset', response_info.getBodyOffset())
+                    except Exception:
+                        body_offset = response_info.getBodyOffset()
+                    index_hint = diag.get('raw_canary_index') if isinstance(diag, dict) else None
+                    self._debug_near_miss(response_bytes, body_offset, canary, index_hint)
                 return False
 
-            # Track message and markers (may be empty if decompressed)
+            # Track message and markers (raw matches only)
             base_msg = http_request_response
             key = id(base_msg)
             if key not in message_markers:
@@ -974,85 +1042,366 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             traceback.print_exc()
             return ''
 
-    def _search_payload_and_mark(self, http_request_response, payload, response_info):
-        """
-        Returns dict: {
-          'found': bool,
-          'markers': list of [start,end] byte ranges (may be empty),
-          'snippet': unicode snippet around the first match (safe to render)
-        }
-        Strategy:
-          - Only treat verbatim raw (uncompressed) matches as reflections.
-          - Compressed bodies may be decompressed for inspection, but never count as found.
-        """
+    def _search_payload_and_mark(self, http_request_response, payload, response_info, canary):
+        result = {'found': False, 'markers': [], 'snippet': u'', 'diag': {}}
         try:
             resp_bytes = http_request_response.getResponse()
             if resp_bytes is None:
-                return {'found': False, 'markers': [], 'snippet': ''}
+                result['diag'] = {'error': 'no_response'}
+                return result
 
-            body_offset = response_info.getBodyOffset()
-            enc = self._get_header_value(response_info, "content-encoding")
-            enc_l = (enc or '').lower()
+            try:
+                body_offset = response_info.getBodyOffset()
+            except Exception:
+                body_offset = 0
 
-            pat = self._helpers.stringToBytes(payload)
-            if pat is None:
-                return {'found': False, 'markers': [], 'snippet': ''}
+            enc_value = self._get_header_value(response_info, 'content-encoding')
+            enc_lower = enc_value.lower() if enc_value else ''
 
-            # Raw match search (no compression or identity)
-            if not enc_l or 'identity' in enc_l:
-                total_len = len(resp_bytes)
-                start = self._helpers.indexOf(resp_bytes, pat, True, body_offset, total_len)
-                if start == -1:
-                    return {'found': False, 'markers': [], 'snippet': ''}
+            try:
+                payload_bytes_java = self._helpers.stringToBytes(payload)
+            except Exception:
+                payload_bytes_java = None
+            payload_bytes_py = self._to_bytes(payload_bytes_java) if payload_bytes_java is not None else ''
+            payload_len = len(payload_bytes_java) if payload_bytes_java is not None else 0
 
-                markers = []
-                pat_len = len(pat)
-                cur = start
-                while cur != -1:
-                    markers.append([cur, cur + pat_len])
-                    cur = self._helpers.indexOf(resp_bytes, pat, True, cur + pat_len, total_len)
+            diag = {
+                'body_offset': body_offset,
+                'content_encoding': enc_value or '',
+                'identity_encoding': (not enc_lower) or ('identity' in enc_lower),
+                'payload': payload,
+                'payload_length': payload_len,
+                'payload_urlencoded': '',
+                'payload_htmlencoded': self._html_escape(payload if payload is not None else ''),
+                'raw_found': False,
+                'raw_first_index': -1,
+                'raw_markers_count': 0,
+                'raw_snippet': u'',
+                'raw_canary_found': False,
+                'raw_canary_index': -1,
+                'raw_canary_snippet': u'',
+                'was_compressed': False,
+                'decomp_found_exact': False,
+                'decomp_exact_index': -1,
+                'decomp_found_urlenc': False,
+                'decomp_urlenc_index': -1,
+                'decomp_found_htmlenc': False,
+                'decomp_htmlenc_index': -1,
+                'decomp_snippet_exact': u'',
+                'decomp_snippet_urlenc': u'',
+                'decomp_snippet_htmlenc': u'',
+                'notes': []
+            }
 
-                resp_raw = self._to_bytes(resp_bytes)
-                payload_bytes = self._to_bytes(pat)
-                snippet = self._build_snippet(resp_raw, payload_bytes)
-                return {'found': True, 'markers': markers, 'snippet': snippet}
+            try:
+                diag['payload_urlencoded'] = self._safe_to_unicode(self._helpers.urlEncode(payload if payload is not None else ''))
+            except Exception:
+                diag['payload_urlencoded'] = ''
 
-            # Compressed bodies: optional inspection but never treated as raw reflections
+            def _build_snippet(raw_str, index, length, window=60):
+                if raw_str is None or index is None:
+                    return u''
+                try:
+                    if index < 0:
+                        return u''
+                    start = max(0, int(index) - window)
+                    end = min(len(raw_str), int(index) + int(length) + window)
+                    segment = raw_str[start:end]
+                    return self._safe_to_unicode(segment)
+                except Exception:
+                    return u''
+
+            def _clip(text, limit=160):
+                if text is None:
+                    return u''
+                try:
+                    length = len(text)
+                except Exception:
+                    try:
+                        text = self._safe_to_unicode(text)
+                        length = len(text)
+                    except Exception:
+                        return u''
+                if length > limit:
+                    try:
+                        return text[:limit] + u'…'
+                    except Exception:
+                        return text
+                return text
+
+            total_len = len(resp_bytes)
             resp_raw = self._to_bytes(resp_bytes)
+            raw_markers = []
+            if payload_len > 0 and payload_bytes_java is not None:
+                try:
+                    raw_index = self._helpers.indexOf(resp_bytes, payload_bytes_java, True, body_offset, total_len)
+                except Exception:
+                    raw_index = -1
+                diag['raw_first_index'] = raw_index
+                if raw_index != -1:
+                    diag['raw_found'] = True
+                    cur = raw_index
+                    while cur != -1 and payload_len > 0:
+                        raw_markers.append([int(cur), int(cur + payload_len)])
+                        try:
+                            cur = self._helpers.indexOf(resp_bytes, payload_bytes_java, True, cur + payload_len, total_len)
+                        except Exception:
+                            break
+                    diag['raw_markers_count'] = len(raw_markers)
+                    snippet = _build_snippet(resp_raw, raw_index, payload_len)
+                    diag['raw_snippet'] = _clip(snippet)
+                    result['snippet'] = snippet
+                else:
+                    diag['raw_markers_count'] = 0
+
+            if canary:
+                try:
+                    canary_bytes_java = self._helpers.stringToBytes(canary)
+                except Exception:
+                    canary_bytes_java = None
+                if canary_bytes_java is not None:
+                    try:
+                        canary_index = self._helpers.indexOf(resp_bytes, canary_bytes_java, True, body_offset, total_len)
+                    except Exception:
+                        canary_index = -1
+                    diag['raw_canary_index'] = canary_index
+                    if canary_index != -1:
+                        diag['raw_canary_found'] = True
+                        canary_len = len(canary_bytes_java)
+                        canary_snippet = _build_snippet(resp_raw, canary_index, canary_len)
+                        diag['raw_canary_snippet'] = _clip(canary_snippet)
+
             raw_body = resp_raw[body_offset:]
             search_body, was_decomp = self._decompress_if_needed(raw_body, response_info)
+            diag['was_compressed'] = bool(was_decomp)
             if was_decomp:
-                payload_bytes = self._to_bytes(pat)
-                if search_body.find(payload_bytes) != -1:
-                    # Match only exists post-decompression; treat as near-miss
-                    return {'found': False, 'markers': [], 'snippet': ''}
+                try:
+                    diag['decompressed_length'] = len(search_body)
+                except Exception:
+                    diag['decompressed_length'] = 0
+                if payload_len > 0 and payload_bytes_py is not None:
+                    try:
+                        idx = search_body.find(payload_bytes_py)
+                    except Exception:
+                        idx = -1
+                    diag['decomp_exact_index'] = idx
+                    if idx != -1:
+                        diag['decomp_found_exact'] = True
+                        diag['decomp_snippet_exact'] = _clip(_build_snippet(search_body, idx, payload_len))
+                payload_url = diag.get('payload_urlencoded', '') or ''
+                if payload_url:
+                    try:
+                        idx_url = search_body.find(payload_url)
+                    except Exception:
+                        idx_url = -1
+                    diag['decomp_urlenc_index'] = idx_url
+                    if idx_url != -1:
+                        diag['decomp_found_urlenc'] = True
+                        diag['decomp_snippet_urlenc'] = _clip(_build_snippet(search_body, idx_url, len(payload_url)))
+                payload_html = diag.get('payload_htmlencoded', '') or ''
+                if payload_html:
+                    try:
+                        idx_html = search_body.find(payload_html)
+                    except Exception:
+                        idx_html = -1
+                    diag['decomp_htmlenc_index'] = idx_html
+                    if idx_html != -1:
+                        diag['decomp_found_htmlenc'] = True
+                        diag['decomp_snippet_htmlenc'] = _clip(_build_snippet(search_body, idx_html, len(payload_html)))
 
-            return {'found': False, 'markers': [], 'snippet': ''}
+            if diag['raw_found'] and not diag['identity_encoding']:
+                diag['notes'].append('Raw match present but response declared compressed encoding')
+            if payload_len == 0:
+                diag['notes'].append('Empty payload supplied; skipping raw search')
 
+            result['found'] = diag['raw_found'] and diag['identity_encoding'] and payload_len > 0
+            if result['found']:
+                result['markers'] = raw_markers
+                if not result['snippet']:
+                    result['snippet'] = diag.get('raw_snippet', u'')
+            else:
+                result['markers'] = []
+                if not result['snippet']:
+                    result['snippet'] = u''
+
+            result['diag'] = diag
+            return result
         except Exception:
             traceback.print_exc()
-            return {'found': False, 'markers': [], 'snippet': ''}
+            result['diag'] = {'error': 'exception'}
+            return result
 
-    def _debug_near_miss(self, resp_bytes, body_offset, canary):
+    def _debug_near_miss(self, resp_bytes, body_offset, canary, index_hint=None):
         try:
+            if not self._debug_verbose:
+                return
             if resp_bytes is None or not canary:
                 return
             canary_pat = self._helpers.stringToBytes(canary)
             if canary_pat is None:
                 return
             total_len = len(resp_bytes)
-            idx = self._helpers.indexOf(resp_bytes, canary_pat, True, body_offset, total_len)
+            if index_hint is None or index_hint < 0:
+                idx = self._helpers.indexOf(resp_bytes, canary_pat, True, body_offset, total_len)
+            else:
+                idx = index_hint
             if idx == -1:
                 return
             resp_raw = self._to_bytes(resp_bytes)
             canary_raw = self._to_bytes(canary_pat)
-            start = max(0, idx - 40)
-            end = min(len(resp_raw), idx + len(canary_raw) + 40)
+            start = max(0, idx - 60)
+            end = min(len(resp_raw), idx + len(canary_raw) + 60)
             window = resp_raw[start:end]
             preview = self._safe_to_unicode(window)
-            print("[ReflectMe][near-miss] Raw canary context: {0}".format(repr(preview)))
+            self._log("[ReflectMe][DEBUG] Near-miss canary window: {0}".format(repr(preview)))
         except Exception:
             pass
+
+    def _dump_debug_report(self, http_request_response, response_info, result, payload):
+        if not self._debug_verbose:
+            return
+        try:
+            diag = result.get('diag', {}) if isinstance(result, dict) else {}
+
+            try:
+                status_code = response_info.getStatusCode()
+            except Exception:
+                status_code = 'unknown'
+
+            try:
+                body_offset = diag.get('body_offset', response_info.getBodyOffset())
+            except Exception:
+                body_offset = 0
+
+            content_encoding = diag.get('content_encoding')
+            if not content_encoding:
+                try:
+                    content_encoding = self._get_header_value(response_info, 'content-encoding')
+                except Exception:
+                    content_encoding = ''
+
+            def _make_serializable(value):
+                try:
+                    basestring
+                    string_types = (basestring,)
+                except NameError:
+                    string_types = (str,)
+                if isinstance(value, string_types):
+                    return self._safe_to_unicode(value)
+                try:
+                    number_types = (int, long, float, bool)
+                except NameError:
+                    number_types = (int, float, bool)
+                if isinstance(value, number_types) or value is None:
+                    return value
+                try:
+                    if isinstance(value, dict):
+                        out = {}
+                        for k, v in value.iteritems():
+                            out[self._safe_to_unicode(k)] = _make_serializable(v)
+                        return out
+                except Exception:
+                    pass
+                try:
+                    if isinstance(value, (list, tuple)):
+                        return [_make_serializable(v) for v in value]
+                except Exception:
+                    pass
+                try:
+                    return self._safe_to_unicode(value)
+                except Exception:
+                    try:
+                        return str(value)
+                    except Exception:
+                        return ''
+
+            serializable_diag = {}
+            if isinstance(diag, dict):
+                try:
+                    for key, value in diag.iteritems():
+                        serializable_diag[self._safe_to_unicode(key)] = _make_serializable(value)
+                except Exception:
+                    try:
+                        for key in diag:
+                            serializable_diag[self._safe_to_unicode(key)] = _make_serializable(diag[key])
+                    except Exception:
+                        serializable_diag = {}
+
+            try:
+                diag_text = json.dumps(serializable_diag, ensure_ascii=False)
+            except Exception:
+                try:
+                    diag_text = self._safe_to_unicode(serializable_diag)
+                except Exception:
+                    diag_text = ''
+
+            try:
+                headers = response_info.getHeaders()
+                if headers is None:
+                    headers = []
+            except Exception:
+                headers = []
+
+            resp_bytes = http_request_response.getResponse()
+            resp_raw = self._to_bytes(resp_bytes) if resp_bytes is not None else ''
+            raw_preview = ''
+            if resp_raw:
+                end_index = body_offset + int(getattr(self, '_debug_max_dump', 4000))
+                raw_preview = resp_raw[body_offset:end_index]
+            raw_preview_unicode = self._safe_to_unicode(raw_preview)
+
+            decomp_preview_unicode = ''
+            if isinstance(diag, dict) and diag.get('was_compressed'):
+                raw_body = resp_raw[body_offset:]
+                search_body, was_decomp = self._decompress_if_needed(raw_body, response_info)
+                if was_decomp and search_body:
+                    max_len = int(getattr(self, '_debug_max_dump', 4000))
+                    decomp_preview = search_body[:max_len]
+                    decomp_preview_unicode = self._safe_to_unicode(decomp_preview)
+
+            try:
+                payload_display = self._safe_to_unicode(payload)
+            except Exception:
+                payload_display = ''
+
+            snippet_display = result.get('snippet', u'') if isinstance(result, dict) else u''
+            snippet_display = self._safe_to_unicode(snippet_display)
+
+            lines = []
+            lines.append("[ReflectMe][DEBUG] === SEARCH START ===")
+            lines.append("Status: {0}".format(status_code))
+            lines.append("Content-Encoding: {0}".format(content_encoding if content_encoding else '(none)'))
+            lines.append("Body offset: {0}".format(body_offset))
+            lines.append("Payload: {0}".format(repr(payload_display)))
+            lines.append("RAW reflection result: {0}".format(bool(result.get('found')) if isinstance(result, dict) else False))
+            lines.append("Raw match detected: {0}".format(bool(diag.get('raw_found')) if isinstance(diag, dict) else False))
+            lines.append("Diagnostics: {0}".format(self._safe_to_unicode(diag_text)))
+            notes = []
+            if isinstance(diag, dict):
+                notes = diag.get('notes', []) or []
+            if notes:
+                try:
+                    lines.append("Notes: {0}".format(self._safe_to_unicode(', '.join([self._safe_to_unicode(n) for n in notes]))))
+                except Exception:
+                    pass
+            lines.append("Response headers:")
+            for header in headers:
+                try:
+                    header_text = self._safe_to_unicode(header)
+                except Exception:
+                    header_text = str(header)
+                lines.append("  {0}".format(header_text))
+            lines.append("Raw body preview (first {0} bytes):".format(int(getattr(self, '_debug_max_dump', 4000))))
+            lines.append(raw_preview_unicode)
+            if decomp_preview_unicode:
+                lines.append("Decompressed body preview (first {0} bytes):".format(int(getattr(self, '_debug_max_dump', 4000))))
+                lines.append(decomp_preview_unicode)
+            if snippet_display:
+                lines.append("Snippet: {0}".format(repr(snippet_display)))
+            lines.append("[ReflectMe][DEBUG] === SEARCH END ===")
+            self._log('\n'.join(lines))
+        except Exception:
+            traceback.print_exc()
 
     def _chunk_list(self, data, size):
         chunks = []
