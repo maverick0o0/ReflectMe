@@ -803,7 +803,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             # strip our loop-prevention header if present
             if lower.startswith('x-jxr-ext'):
                 continue
-            # drop Accept-Encoding to avoid compressed bodies in active tests
+            # drop Accept-Encoding to enforce identity encoding
             if lower.startswith('accept-encoding'):
                 continue
             if first_line is None:
@@ -856,6 +856,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             # --- NEW unified search ---
             result = self._search_payload_and_mark(http_request_response, payload, response_info)
             if not result.get('found'):
+                try:
+                    body_offset = response_info.getBodyOffset()
+                except Exception:
+                    body_offset = 0
+                self._debug_near_miss(response_bytes, body_offset, canary)
                 return False
 
             # Track message and markers (may be empty if decompressed)
@@ -977,64 +982,77 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
           'snippet': unicode snippet around the first match (safe to render)
         }
         Strategy:
-          - Prefer searching on raw Java byte[] with helpers.indexOf when not compressed.
-          - If compressed (gzip/deflate), decompress body and search there; return no markers.
+          - Only treat verbatim raw (uncompressed) matches as reflections.
+          - Compressed bodies may be decompressed for inspection, but never count as found.
         """
         try:
-            # Raw response bytes and offsets
-            resp_bytes = http_request_response.getResponse()  # Java byte[]
+            resp_bytes = http_request_response.getResponse()
             if resp_bytes is None:
                 return {'found': False, 'markers': [], 'snippet': ''}
 
             body_offset = response_info.getBodyOffset()
-
-            # Detect compression
             enc = self._get_header_value(response_info, "content-encoding")
             enc_l = (enc or '').lower()
 
-            # Pattern as Java byte[] (ASCII-safe for our payloads)
             pat = self._helpers.stringToBytes(payload)
+            if pat is None:
+                return {'found': False, 'markers': [], 'snippet': ''}
 
-            # Path A: no compression -> use helpers.indexOf over raw byte[]
+            # Raw match search (no compression or identity)
             if not enc_l or 'identity' in enc_l:
-                start = self._helpers.indexOf(resp_bytes, pat, True, body_offset, len(resp_bytes))
+                total_len = len(resp_bytes)
+                start = self._helpers.indexOf(resp_bytes, pat, True, body_offset, total_len)
                 if start == -1:
                     return {'found': False, 'markers': [], 'snippet': ''}
 
-                # Collect all occurrences for markers
                 markers = []
                 pat_len = len(pat)
                 cur = start
                 while cur != -1:
                     markers.append([cur, cur + pat_len])
-                    cur = self._helpers.indexOf(resp_bytes, pat, True, cur + pat_len, len(resp_bytes))
+                    cur = self._helpers.indexOf(resp_bytes, pat, True, cur + pat_len, total_len)
 
-                # Build snippet from the raw-bytes view we already maintain
                 resp_raw = self._to_bytes(resp_bytes)
-                snippet = self._build_snippet(resp_raw, self._to_bytes(payload))
+                payload_bytes = self._to_bytes(pat)
+                snippet = self._build_snippet(resp_raw, payload_bytes)
                 return {'found': True, 'markers': markers, 'snippet': snippet}
 
-            # Path B: compressed -> decompress body only, search, but return no markers
+            # Compressed bodies: optional inspection but never treated as raw reflections
             resp_raw = self._to_bytes(resp_bytes)
             raw_body = resp_raw[body_offset:]
             search_body, was_decomp = self._decompress_if_needed(raw_body, response_info)
+            if was_decomp:
+                payload_bytes = self._to_bytes(pat)
+                if search_body.find(payload_bytes) != -1:
+                    # Match only exists post-decompression; treat as near-miss
+                    return {'found': False, 'markers': [], 'snippet': ''}
 
-            if not was_decomp:
-                # Could be an unsupported encoding; bail out
-                return {'found': False, 'markers': [], 'snippet': ''}
-
-            payload_bytes = self._to_bytes(payload)
-            idx = search_body.find(payload_bytes)
-            if idx == -1:
-                return {'found': False, 'markers': [], 'snippet': ''}
-
-            snippet = self._build_snippet(search_body, payload_bytes)
-            # no markers because we cannot map decompressed offsets back to the wire
-            return {'found': True, 'markers': [], 'snippet': snippet}
+            return {'found': False, 'markers': [], 'snippet': ''}
 
         except Exception:
             traceback.print_exc()
             return {'found': False, 'markers': [], 'snippet': ''}
+
+    def _debug_near_miss(self, resp_bytes, body_offset, canary):
+        try:
+            if resp_bytes is None or not canary:
+                return
+            canary_pat = self._helpers.stringToBytes(canary)
+            if canary_pat is None:
+                return
+            total_len = len(resp_bytes)
+            idx = self._helpers.indexOf(resp_bytes, canary_pat, True, body_offset, total_len)
+            if idx == -1:
+                return
+            resp_raw = self._to_bytes(resp_bytes)
+            canary_raw = self._to_bytes(canary_pat)
+            start = max(0, idx - 40)
+            end = min(len(resp_raw), idx + len(canary_raw) + 40)
+            window = resp_raw[start:end]
+            preview = self._safe_to_unicode(window)
+            print("[ReflectMe][near-miss] Raw canary context: {0}".format(repr(preview)))
+        except Exception:
+            pass
 
     def _chunk_list(self, data, size):
         chunks = []
