@@ -988,19 +988,35 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
         return chunks
 
     def _to_bytes(self, data):
+        """
+        Convert Burp/Java byte[] or Python/Jython str/unicode into a Python 'str' of raw bytes.
+        Never use Java .toString() on byte[].
+        """
         if data is None:
             return ''
+        # Fast path: if it's already a Python/Jython string, return as-is
         try:
-            return data.tostring()
+            # In Jython 2.7, 'str' is unicode; that's OK for ASCII payloads; we treat it as a byte sequence here.
+            if isinstance(data, basestring):
+                return data
+        except NameError:
+            # Py3 on Jython isn't used, but keep compatibility
+            if isinstance(data, str):
+                return data
+        # Try to iterate java byte[] and build bytes safely
+        try:
+            out = []
+            for b in data:
+                # java byte is signed; map to 0..255
+                out.append(chr((b + 256) % 256))
+            return ''.join(out)
         except Exception:
             pass
+        # Last resort
         try:
-            return ''.join(chr((b + 256) % 256) for b in data)
+            return str(data)
         except Exception:
-            try:
-                return str(data)
-            except Exception:
-                return ''
+            return ''
 
     def _get_header_value(self, response_info, key_lower):
         try:
