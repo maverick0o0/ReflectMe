@@ -9,6 +9,7 @@ from javax.swing import (JPanel, JLabel, JCheckBox, JButton, JTextField,
 from javax.swing.table import AbstractTableModel
 from javax.swing.event import ChangeListener
 from javax.swing import AbstractAction
+from jarray import array as jarray
 import threading
 import re
 import json
@@ -307,6 +308,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             "multipart/x-mixed-replace",
             "application/rdf+xml",
             "application/mathml+xml",
+            "application/json",
+            "text/plain",
         ]
         for value in defaults:
             self._allowed_model.add_value(value, True)
@@ -717,10 +720,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 for key in message_markers:
                     item = message_markers[key]
                     markers_list = ArrayList()
-                    for marker in item['markers']:
-                        markers_list.add(marker)
-                    marked = self._callbacks.applyMarkers(item['message'], None, markers_list)
-                    http_messages.append(marked)
+                    for start, end in item['markers']:
+                        markers_list.add(jarray('i', [int(start), int(end)]))
+                    base_msg = item['message']
+                    try:
+                        marked = self._callbacks.applyMarkers(base_msg, None, markers_list)
+                        http_messages.append(marked if marked is not None else base_msg)
+                    except Exception:
+                        http_messages.append(base_msg)
                 detail = self._build_issue_detail(issue_entries)
                 issue = ReflectMeIssue(service, request_info.getUrl(),
                                        "Reflected input detected (ReflectMe)",
@@ -856,10 +863,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 index = body_bytes.find(payload_bytes, index + payload_length)
             if not markers:
                 return False
-            persisted = self._callbacks.saveBuffersToTempFiles(http_request_response)
-            key = id(persisted)
+            base_msg = http_request_response
+            key = id(base_msg)
             if key not in message_markers:
-                message_markers[key] = {'message': persisted, 'markers': []}
+                message_markers[key] = {'message': base_msg, 'markers': []}
             for marker in markers:
                 message_markers[key]['markers'].append(marker)
             content_type = self._extract_content_type(response_info)
