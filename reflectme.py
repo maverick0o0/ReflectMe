@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from burp import IBurpExtender, ITab, IHttpListener, IScanIssue, IParameter
 from java.awt import Dimension
 from java.awt.event import ActionListener
