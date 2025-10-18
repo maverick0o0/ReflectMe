@@ -1861,19 +1861,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
             if payload_len > 0 and diag['identity_encoding'] and raw_markers:
                 found = True
                 markers_to_use = raw_markers
-            elif adjacency_markers and diag['identity_encoding']:
-                found = True
-                markers_to_use = adjacency_markers
-                diag['adjacency_used'] = True
-                if adjacency_first_index != -1:
-                    snippet = _build_snippet(resp_raw, adjacency_first_index, canary_len)
-                    if snippet:
-                        result['snippet'] = snippet
-                    diag['raw_canary_snippet'] = _clip(_build_snippet(resp_raw, adjacency_first_index, canary_len))
-                diag['notes'].append('Adjacency rule triggered (special-char neighbour: {0}, side: {1})'.format(
-                    adjacency_char or '', adjacency_side or ''))
             else:
                 diag['adjacency_used'] = False
+                if adjacency_markers and diag['identity_encoding']:
+                    if adjacency_first_index != -1:
+                        diag['adjacency_first_index'] = adjacency_first_index
+                        diag['adjacent_char'] = adjacency_char or ''
+                        diag['adjacent_side'] = adjacency_side or ''
+                        diag['raw_canary_snippet'] = _clip(_build_snippet(resp_raw, adjacency_first_index, canary_len))
+                    diag['notes'].append('Adjacency indicators observed but ignored because the full payload was not reflected '
+                                          '(neighbour: {0}, side: {1})'.format(adjacency_char or '', adjacency_side or ''))
 
             if found:
                 result['found'] = True
