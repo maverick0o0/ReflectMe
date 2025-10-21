@@ -35,11 +35,17 @@ sys.modules.setdefault('burp', burp_module)
 java_module = types.ModuleType('java')
 awt_module = types.ModuleType('java.awt')
 
-class Dimension(object):
+class _AwtPlaceholder(object):
     def __init__(self, *args, **kwargs):
         pass
 
-awt_module.Dimension = Dimension
+# Provide all attributes imported by reflectme.py so the module loads in tests.
+for name in [
+    'Dimension', 'BorderLayout', 'GridBagLayout', 'GridBagConstraints',
+    'Insets', 'FlowLayout', 'Color'
+]:
+    setattr(awt_module, name, type(name, (_AwtPlaceholder,), {}))
+
 sys.modules.setdefault('java', java_module)
 sys.modules.setdefault('java.awt', awt_module)
 java_module.awt = awt_module
@@ -63,10 +69,12 @@ class _SwingComponent(object):
     def __init__(self, *args, **kwargs):
         pass
 
+# reflectme imports a fairly large set of swing classes; stub them all.
 for name in [
     'JPanel', 'JLabel', 'JCheckBox', 'JButton', 'JTextField',
     'JScrollPane', 'JTable', 'BoxLayout', 'JTextArea', 'JSpinner',
-    'SpinnerNumberModel', 'KeyStroke', 'AbstractAction'
+    'SpinnerNumberModel', 'KeyStroke', 'AbstractAction', 'JTabbedPane',
+    'JSeparator', 'BorderFactory', 'UIManager', 'Box'
 ]:
     setattr(swing_module, name, type(name, (_SwingComponent,), {}))
 sys.modules.setdefault('javax.swing', swing_module)
@@ -159,6 +167,12 @@ class MockCallbacks(object):
         self.saved_messages.append(http_request_response)
         return http_request_response
 
+    def addScanIssue(self, issue):
+        pass
+
+    def issueAlert(self, message):
+        pass
+
 
 class MockHttpRequestResponse(object):
     def __init__(self, raw, response_info):
@@ -173,6 +187,15 @@ def build_response(payload):
     headers = ["HTTP/1.1 200 OK", "Content-Type: text/html"]
     header_blob = "\r\n".join(headers) + "\r\n\r\n"
     body = "Hello {} world".format(payload)
+    body_offset = len(header_blob)
+    raw = header_blob + body
+    response_info = MockResponseInfo(headers, body_offset)
+    return MockHttpRequestResponse(raw, response_info)
+
+
+def build_custom_body_response(body):
+    headers = ["HTTP/1.1 200 OK", "Content-Type: text/html"]
+    header_blob = "\r\n".join(headers) + "\r\n\r\n"
     body_offset = len(header_blob)
     raw = header_blob + body
     response_info = MockResponseInfo(headers, body_offset)
@@ -215,6 +238,60 @@ class ReflectMeLiteralMatchTest(unittest.TestCase):
         self.assertEqual(reflected, payload)
         snippet = issue_entries[0]['snippet']
         self.assertIn('<"mmdhacker">', snippet)
+
+    def test_urlencoded_payload_not_detected(self):
+        extender = BurpExtender.__new__(BurpExtender)
+        extender._callbacks = MockCallbacks()
+        extender._helpers = MockHelpers()
+        extender._allowed_model = DummyAllowedModel()
+        extender._debug_verbose = False
+        extender._debug_max_dump = 4000
+
+        payload = "'mmdhacker"
+        body = 'Value=%27mmdhacker'
+        response = build_custom_body_response(body)
+        issue_entries = []
+        message_markers = {}
+        service = object()
+        rate_key = ('localhost', 80, 'http')
+        mode = 'append'
+        template = 'custom'
+        canary = 'mmdhacker'
+        param_set = [{'name': 'q'}]
+
+        result = extender._handle_test_response(response, payload, service, rate_key,
+                                                mode, template, canary, param_set,
+                                                issue_entries, message_markers)
+        self.assertFalse(result)
+        self.assertEqual(issue_entries, [])
+        self.assertEqual(message_markers, {})
+
+    def test_html_encoded_payload_not_detected(self):
+        extender = BurpExtender.__new__(BurpExtender)
+        extender._callbacks = MockCallbacks()
+        extender._helpers = MockHelpers()
+        extender._allowed_model = DummyAllowedModel()
+        extender._debug_verbose = False
+        extender._debug_max_dump = 4000
+
+        payload = '"mmdhacker'
+        body = 'Value=&#34;mmdhacker'
+        response = build_custom_body_response(body)
+        issue_entries = []
+        message_markers = {}
+        service = object()
+        rate_key = ('localhost', 80, 'http')
+        mode = 'append'
+        template = 'custom'
+        canary = 'mmdhacker'
+        param_set = [{'name': 'q'}]
+
+        result = extender._handle_test_response(response, payload, service, rate_key,
+                                                mode, template, canary, param_set,
+                                                issue_entries, message_markers)
+        self.assertFalse(result)
+        self.assertEqual(issue_entries, [])
+        self.assertEqual(message_markers, {})
 
 
 if __name__ == '__main__':
