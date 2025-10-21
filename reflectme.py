@@ -1611,8 +1611,27 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                 payload_bytes_java = self._helpers.stringToBytes(payload)
             except Exception:
                 payload_bytes_java = None
-            payload_bytes_py = self._to_bytes(payload_bytes_java) if payload_bytes_java is not None else ''
-            payload_len = len(payload_bytes_java) if payload_bytes_java is not None else 0
+
+            if payload_bytes_java is not None:
+                try:
+                    payload_bytes_py = self._to_bytes(payload_bytes_java)
+                except Exception:
+                    payload_bytes_py = ''
+            else:
+                payload_bytes_py = ''
+
+            if payload_bytes_py is None:
+                payload_bytes_py = ''
+
+            try:
+                payload_len = len(payload_bytes_py)
+            except Exception:
+                try:
+                    payload_bytes_py = self._safe_to_unicode(payload_bytes_py)
+                    payload_len = len(payload_bytes_py)
+                except Exception:
+                    payload_bytes_py = ''
+                    payload_len = 0
 
             diag = {
                 'body_offset': body_offset,
@@ -1711,6 +1730,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener):
                     if idx_py == -1:
                         break
                     if idx_py < body_offset:
+                        search_pos = idx_py + 1
+                        continue
+                    segment = resp_raw[idx_py: idx_py + payload_len]
+                    if segment != payload_bytes_py:
                         search_pos = idx_py + 1
                         continue
                     raw_markers.append([int(idx_py), int(idx_py + payload_len)])
